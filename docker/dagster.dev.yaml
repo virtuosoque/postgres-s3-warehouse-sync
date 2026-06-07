@@ -13,7 +13,19 @@ run_coordinator:
   module: dagster.core.run_coordinator
   class: QueuedRunCoordinator
   config:
+    # Sized for a 16-core / 32 GB host. Total heavy extract workers =
+    # (concurrent bootstrap runs) x (BOOTSTRAP_MAX_CONCURRENT chunks per run).
+    # Hard global caps below keep that bounded no matter how many objects you
+    # select: <= 3 bootstrap runs x 4 chunks = 12 concurrent extract workers,
+    # plus <= 4 incremental runs (1 worker each). Tune to your host/RDS.
     max_concurrent_runs: 8
+    tag_concurrency_limits:
+      - key: "kind"
+        value: "bootstrap"
+        limit: 3
+      - key: "kind"
+        value: "incremental"
+        limit: 4
 
 run_launcher:
   module: dagster.core.launcher

@@ -24,7 +24,7 @@ from dagster import (
 # Cap how many chunks extract concurrently. Each worker holds a row batch in
 # memory, so size this to the host: ~roughly (RAM_GB - 2) / 0.8 workers.
 # Tune via BOOTSTRAP_MAX_CONCURRENT without code changes.
-_BOOTSTRAP_MAX_CONCURRENT = int(os.environ.get("BOOTSTRAP_MAX_CONCURRENT", "8"))
+_BOOTSTRAP_MAX_CONCURRENT = int(os.environ.get("BOOTSTRAP_MAX_CONCURRENT", "4"))
 _BOOTSTRAP_EXECUTOR = multiprocess_executor.configured(
     {"max_concurrent": _BOOTSTRAP_MAX_CONCURRENT}
 )

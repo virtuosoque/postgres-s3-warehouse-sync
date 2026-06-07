@@ -44,7 +44,7 @@ def _graphql_url() -> str:
     return os.environ.get("DAGSTER_GRAPHQL_URL", "http://dagster:3000/graphql")
 
 
-def _launch(job_name: str, run_config: dict) -> dict:
+def _launch(job_name: str, run_config: dict, tags: dict | None = None) -> dict:
     params = {
         "selector": {
             "repositoryLocationName": _LOCATION,
@@ -52,6 +52,12 @@ def _launch(job_name: str, run_config: dict) -> dict:
             "jobName": job_name,
         },
         "runConfigData": json.dumps(run_config),
+        # Tag the run so the QueuedRunCoordinator's tag_concurrency_limits (by
+        # "kind") apply to UI-launched runs too, and so recent_runs can filter
+        # by connection.
+        "executionMetadata": {
+            "tags": [{"key": k, "value": v} for k, v in (tags or {}).items()]
+        },
     }
     with httpx.Client(timeout=30.0) as client:
         resp = client.post(_graphql_url(), json={"query": _LAUNCH, "variables": {"p": params}})
@@ -65,18 +71,26 @@ def _launch(job_name: str, run_config: dict) -> dict:
     return data["run"]
 
 
+def _run_tags(connection_id: int, table_fqn: str, kind: str) -> dict:
+    return {"kind": kind, "table": table_fqn, "connection": str(connection_id)}
+
+
 def launch_bootstrap(connection_id: int, table_fqn: str) -> dict:
-    return _launch("bootstrap_table_job", {
-        "ops": {"plan_bootstrap": {"config": {
-            "connection_id": connection_id, "table_fqn": table_fqn}}}
-    })
+    return _launch(
+        "bootstrap_table_job",
+        {"ops": {"plan_bootstrap": {"config": {
+            "connection_id": connection_id, "table_fqn": table_fqn}}}},
+        tags=_run_tags(connection_id, table_fqn, "bootstrap"),
+    )
 
 
 def launch_incremental(connection_id: int, table_fqn: str) -> dict:
-    return _launch("incremental_job", {
-        "ops": {"incremental_one_table": {"config": {
-            "connection_id": connection_id, "table_fqn": table_fqn}}}
-    })
+    return _launch(
+        "incremental_job",
+        {"ops": {"incremental_one_table": {"config": {
+            "connection_id": connection_id, "table_fqn": table_fqn}}}},
+        tags=_run_tags(connection_id, table_fqn, "incremental"),
+    )
 
 
 def run_status(run_id: str) -> dict:
