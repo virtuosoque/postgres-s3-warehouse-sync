@@ -141,3 +141,31 @@ def commit_parquet_files(table: Table, s3_uris: list[str]) -> None:
         return
     table.add_files(file_paths=s3_uris)
     log.info("iceberg.commit.success", n_files=len(s3_uris))
+
+
+def evolve_table_schema(conn: Connection, table: str, source_schema: IcebergSchema) -> Table:
+    """Reconcile the Iceberg table's schema with the current source schema, then
+    return the reloaded table.
+
+    Uses PyIceberg `union_by_name`, which (matching by column name):
+      - ADDS columns present in the source but not the table (old rows read NULL),
+      - applies SAFE type promotions (int->long, float->double, decimal precision
+        increase),
+      - never drops columns (a column removed at the source stays in the lake and
+        is simply NULL for new rows -- standard lakehouse behavior).
+
+    Incompatible changes (e.g. string<->int, decimal SCALE changes) are not valid
+    Iceberg promotions; we log and skip them rather than fail the sync (such a
+    column would need a manual re-bootstrap).
+    """
+    cat = catalog(conn)
+    ident = (conn.iceberg_namespace, table)
+    tbl = cat.load_table(ident)
+    try:
+        with tbl.update_schema() as upd:
+            upd.union_by_name(source_schema)
+        log.info("iceberg.schema.evolved", table=f"{conn.iceberg_namespace}.{table}")
+    except Exception as e:  # noqa: BLE001
+        log.warning("iceberg.schema.evolve_skipped",
+                    table=f"{conn.iceberg_namespace}.{table}", error=str(e))
+    return cat.load_table(ident)

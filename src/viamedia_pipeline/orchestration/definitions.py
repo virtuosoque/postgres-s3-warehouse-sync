@@ -20,6 +20,7 @@ from viamedia_pipeline.orchestration.maintenance_job import (
     maintenance_job,
     weekly_maintenance,
 )
+from viamedia_pipeline.orchestration.reconcile_job import daily_reconcile, reconcile_job
 from viamedia_pipeline.orchestration.resources import SettingsResource
 
 configure_logging()
@@ -39,8 +40,9 @@ defs = Definitions(
         bootstrap_all_tables_job,
         incremental_job,
         maintenance_job,
+        reconcile_job,
     ],
-    schedules=[every_five_minutes_per_table, weekly_maintenance],
+    schedules=[every_five_minutes_per_table, weekly_maintenance, daily_reconcile],
     sensors=[discover_new_tables_sensor],
     resources={"settings": SettingsResource()},
 )

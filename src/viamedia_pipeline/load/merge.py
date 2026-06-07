@@ -18,6 +18,32 @@ from viamedia_pipeline.common.logging import get_logger
 log = get_logger(__name__)
 
 
+def align_to_table(staged: pa.Table, iceberg_table: Table) -> pa.Table:
+    """Reshape a staged Arrow table to exactly match the Iceberg table's current
+    schema: add NULL columns for table columns missing from the source (e.g. a
+    column dropped at the source but kept in the lake), drop source columns not
+    in the table, and cast types to the table's (possibly promoted) types. This
+    keeps `upsert` from failing on a schema mismatch after schema evolution.
+    """
+    from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+    target = schema_to_pyarrow(iceberg_table.schema())
+    have = set(staged.schema.names)
+    arrays = []
+    for field in target:
+        if field.name in have:
+            col = staged.column(field.name)
+            if col.type != field.type:
+                try:
+                    col = col.cast(field.type)
+                except Exception:  # noqa: BLE001
+                    col = col.cast(field.type, safe=False)
+            arrays.append(col)
+        else:
+            arrays.append(pa.nulls(staged.num_rows, type=field.type))
+    return pa.table(arrays, schema=target)
+
+
 def merge_arrow_table(
     iceberg_table: Table,
     staged: pa.Table,
@@ -34,6 +60,9 @@ def merge_arrow_table(
     """
     if "updated_at" in staged.schema.names and "id" in staged.schema.names:
         staged = _dedupe_latest(staged, key="id", ts="updated_at")
+
+    # Align to the table's (possibly just-evolved) schema before upserting.
+    staged = align_to_table(staged, iceberg_table)
 
     result = iceberg_table.upsert(
         df=staged,

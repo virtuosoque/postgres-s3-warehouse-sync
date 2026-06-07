@@ -30,7 +30,11 @@ from viamedia_pipeline.extract.schema import (
     introspect_columns,
     pg_oids_for,
 )
-from viamedia_pipeline.load.iceberg_writer import create_or_get_table, ensure_namespace
+from viamedia_pipeline.load.iceberg_writer import (
+    create_or_get_table,
+    ensure_namespace,
+    evolve_table_schema,
+)
 from viamedia_pipeline.load.merge import load_staging_arrow, merge_arrow_table
 from viamedia_pipeline.orchestration.tables import get_table, get_tables
 
@@ -56,6 +60,9 @@ def incremental_one_table(context: OpExecutionContext) -> dict:
     iceberg_schema = iceberg_schema_for(cols)
     tbl = create_or_get_table(conn, cfg.iceberg_table_name, iceberg_schema,
                               partition_by=list(cfg.partition_by))
+    # Reconcile the table schema with the current source (add new columns, keep
+    # dropped ones as NULL, apply safe type promotions) before merging.
+    tbl = evolve_table_schema(conn, cfg.iceberg_table_name, iceberg_schema)
 
     now = datetime.now(timezone.utc)
     s3_prefix = f"incremental/{fqn}"

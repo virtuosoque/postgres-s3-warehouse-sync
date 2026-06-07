@@ -93,6 +93,15 @@ def launch_incremental(connection_id: int, table_fqn: str) -> dict:
     )
 
 
+def launch_reconcile(connection_id: int, table_fqn: str) -> dict:
+    return _launch(
+        "reconcile_job",
+        {"ops": {"reconcile_one_table": {"config": {
+            "connection_id": connection_id, "table_fqn": table_fqn}}}},
+        tags=_run_tags(connection_id, table_fqn, "reconcile"),
+    )
+
+
 def run_status(run_id: str) -> dict:
     with httpx.Client(timeout=15.0) as client:
         resp = client.post(_graphql_url(), json={"query": _STATUS, "variables": {"id": run_id}})

@@ -201,7 +201,8 @@ async function loadObjects(){
       el("button",{class:"btn alt",onclick:()=>toggleAll(false)},"Uncheck all"),
       el("span",{class:"grow"}),
       el("button",{class:"btn",onclick:()=>syncNow(id,"bootstrap")},"Bootstrap checked"),
-      el("button",{class:"btn alt",onclick:()=>syncNow(id,"incremental")},"Incremental checked")));
+      el("button",{class:"btn alt",onclick:()=>syncNow(id,"incremental")},"Incremental checked"),
+      el("button",{class:"btn alt",onclick:()=>syncNow(id,"reconcile")},"Reconcile checked")));
     applyKindFilter();
   }catch(e){box.innerHTML="";box.append(el("div",{class:"bad"},String(e)));}
 }

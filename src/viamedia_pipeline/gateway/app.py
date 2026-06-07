@@ -98,7 +98,7 @@ class SelectionItem(BaseModel):
 class RunLaunch(BaseModel):
     connection_id: int
     table_fqn: str
-    mode: str = Field("bootstrap", pattern="^(bootstrap|incremental)$")
+    mode: str = Field("bootstrap", pattern="^(bootstrap|incremental|reconcile)$")
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -304,6 +304,8 @@ def launch_run(body: RunLaunch, principal: Principal = Depends(current_principal
     try:
         if body.mode == "incremental":
             run = dagster_client.launch_incremental(body.connection_id, body.table_fqn)
+        elif body.mode == "reconcile":
+            run = dagster_client.launch_reconcile(body.connection_id, body.table_fqn)
         else:
             run = dagster_client.launch_bootstrap(body.connection_id, body.table_fqn)
     except Exception as e:  # noqa: BLE001

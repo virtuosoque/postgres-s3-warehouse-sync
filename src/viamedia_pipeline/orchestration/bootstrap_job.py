@@ -50,6 +50,7 @@ from viamedia_pipeline.load.iceberg_writer import (
     commit_parquet_files,
     create_or_get_table,
     ensure_namespace,
+    evolve_table_schema,
 )
 from viamedia_pipeline.orchestration.tables import get_table, get_tables
 from viamedia_pipeline.state import chunks as chunk_state
@@ -82,6 +83,9 @@ def plan_bootstrap(context: OpExecutionContext):
         iceberg_schema = iceberg_schema_for(cols)
         create_or_get_table(conn, cfg.iceberg_table_name, iceberg_schema,
                             partition_by=list(cfg.partition_by))
+        # If re-bootstrapping after a source DDL change, evolve the existing
+        # table so it's a superset of the current source columns before add_files.
+        evolve_table_schema(conn, cfg.iceberg_table_name, iceberg_schema)
         # Parallel id-range chunking only pays off when the key is indexed;
         # otherwise each chunk would full-scan the table, so stream one COPY.
         if cfg.supports_parallel_chunking and has_leading_index(pg_conn, cfg.schema, cfg.table, cfg.pk):
