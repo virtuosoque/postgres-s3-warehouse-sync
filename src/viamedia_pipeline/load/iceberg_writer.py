@@ -8,6 +8,7 @@ own AWS credentials, so we build/cache one catalog per connection.
 import os
 
 from pyiceberg.catalog import Catalog, load_catalog
+from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema as IcebergSchema
 from pyiceberg.table import Table
@@ -15,6 +16,7 @@ from pyiceberg.transforms import BucketTransform, DayTransform, IdentityTransfor
 
 from viamedia_pipeline.common.config_store import Connection
 from viamedia_pipeline.common.logging import get_logger
+from viamedia_pipeline.common.metadata_db import connection as metadata_connection
 from viamedia_pipeline.common.metadata_db import metadata_dsn
 from viamedia_pipeline.common.settings import get_settings
 
@@ -85,25 +87,88 @@ def create_or_get_table(
 
     try:
         return cat.load_table(ident)
-    except Exception:
-        pass
+    except NoSuchTableError:
+        pass  # genuinely new -> create below
+    except Exception as e:  # noqa: BLE001
+        # Registered in the catalog but its metadata couldn't be loaded. If the
+        # metadata.json is *confirmed missing* in S3 (e.g. the bucket folder was
+        # deleted), the catalog row is orphaned -> drop it and recreate. If the
+        # object still exists, this is a transient error -> re-raise (never
+        # destroy a live table on a blip).
+        loc = _catalog_metadata_location(conn, table)
+        if loc and not _s3_object_exists(conn, loc):
+            log.warning("iceberg.table.orphaned_recreating",
+                        table=f"{conn.iceberg_namespace}.{table}", metadata=loc)
+            _drop_catalog_entry(conn, cat, table)
+        else:
+            raise
 
     spec = _build_partition_spec(iceberg_schema, partition_by or [])
-    tbl = cat.create_table(
-        identifier=ident,
-        schema=iceberg_schema,
-        partition_spec=spec,
-        properties={
-            "write.format.default": "parquet",
-            "write.parquet.compression-codec": s.parquet_compression,
-            "write.target-file-size-bytes": str(512 * 1024**2),
-            "write.metadata.delete-after-commit.enabled": "true",
-            "write.metadata.previous-versions-max": "20",
-            "format-version": "2",
-        },
-    )
+    props = {
+        "write.format.default": "parquet",
+        "write.parquet.compression-codec": s.parquet_compression,
+        "write.target-file-size-bytes": str(512 * 1024**2),
+        "write.metadata.delete-after-commit.enabled": "true",
+        "write.metadata.previous-versions-max": "20",
+        "format-version": "2",
+    }
+    try:
+        tbl = cat.create_table(identifier=ident, schema=iceberg_schema,
+                               partition_spec=spec, properties=props)
+    except Exception as e:  # noqa: BLE001
+        # Lost a race / stale row -> drop the catalog entry and create once more.
+        if "already exists" not in repr(e).lower():
+            raise
+        _drop_catalog_entry(conn, cat, table)
+        tbl = cat.create_table(identifier=ident, schema=iceberg_schema,
+                               partition_spec=spec, properties=props)
     log.info("iceberg.table.created", table=f"{conn.iceberg_namespace}.{table}")
     return tbl
+
+
+def _catalog_metadata_location(conn: Connection, table: str) -> str | None:
+    """The metadata_location the SqlCatalog has registered for this table."""
+    try:
+        with metadata_connection() as c, c.cursor() as cur:
+            cur.execute(
+                "SELECT metadata_location FROM iceberg_tables "
+                "WHERE catalog_name = %s AND table_namespace = %s AND table_name = %s",
+                (get_settings().iceberg_catalog_name, conn.iceberg_namespace, table),
+            )
+            row = cur.fetchone()
+        return row["metadata_location"] if row else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _s3_object_exists(conn: Connection, s3_uri: str) -> bool:
+    from viamedia_pipeline.common.s3 import s3_client
+    bucket, _, key = s3_uri.removeprefix("s3://").partition("/")
+    try:
+        s3_client(conn).head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _drop_catalog_entry(conn: Connection, cat: Catalog, table: str) -> None:
+    """Remove a stale catalog row (does NOT touch S3 data)."""
+    ident = (conn.iceberg_namespace, table)
+    try:
+        cat.drop_table(ident)
+        return
+    except Exception:  # noqa: BLE001
+        pass  # drop_table may itself try to read missing metadata -> SQL fallback
+    try:
+        with metadata_connection() as c, c.cursor() as cur:
+            cur.execute(
+                "DELETE FROM iceberg_tables "
+                "WHERE catalog_name = %s AND table_namespace = %s AND table_name = %s",
+                (get_settings().iceberg_catalog_name, conn.iceberg_namespace, table),
+            )
+            c.commit()
+    except Exception as e:  # noqa: BLE001
+        log.warning("iceberg.catalog_entry.delete_failed", table=table, error=str(e))
 
 
 def _build_partition_spec(
