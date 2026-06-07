@@ -1,0 +1,77 @@
+[project]
+name = "viamedia-data-pipeline"
+version = "0.1.0"
+description = "PostgreSQL -> S3/Iceberg -> DuckDB gateway pipeline for PowerBI consumers"
+requires-python = ">=3.12"
+readme = "README.md"
+
+dependencies = [
+    # Postgres
+    "psycopg[binary,pool]>=3.2.3",
+    "sqlalchemy>=2.0.35",  # required by pyiceberg SqlCatalog
+    # Arrow / parquet
+    "pyarrow>=18.0.0",
+    "polars>=1.12.0",
+    # Iceberg (SqlCatalog backed by Postgres; S3 via s3fs)
+    "pyiceberg[s3fs,sql-postgres]>=0.8.1",
+    "boto3>=1.35.0",
+    "botocore>=1.35.0",
+    # Orchestration
+    "dagster>=1.9.0",
+    "dagster-aws>=0.25.0",
+    "dagster-webserver>=1.9.0",
+    "dagster-postgres>=0.25.0",  # PG-backed run/event-log storage
+    # Resilience
+    "tenacity>=9.0.0",
+    # Config
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    # Secrets-at-rest encryption for UI-managed connection credentials
+    "cryptography>=43.0.0",
+    # Logging
+    "structlog>=24.4.0",
+]
+
+[project.optional-dependencies]
+gateway = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "duckdb>=1.1.3",
+    "sqlglot>=25.24.0",
+    "python-jose[cryptography]>=3.3.0",
+    "slowapi>=0.1.9",
+    "httpx>=0.27.0",
+]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-postgresql>=6.1.1",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+]
+
+[project.scripts]
+viamedia-gateway = "viamedia_pipeline.gateway.app:run"
+viamedia-migrate = "viamedia_pipeline.common.migrations:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/viamedia_pipeline"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.dagster]
+module_name = "viamedia_pipeline.orchestration.definitions"

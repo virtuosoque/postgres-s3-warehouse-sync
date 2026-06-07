@@ -1,0 +1,98 @@
+# Run the pipeline LOCALLY on your Mac, but against REAL AWS:
+#   - SOURCE  : your AWS RDS Postgres (read replica)  -> PG_REPLICA_DSN
+#   - TARGET  : your real AWS S3 buckets              -> RAW/CURATED/... + AWS creds
+#   - METADATA: a local Postgres container (Iceberg catalog + watermarks)
+#
+# Unlike docker-compose.dev.yml there is NO localstack, NO source-pg container,
+# and NO AWS_ENDPOINT_URL / dummy creds. boto3 + PyIceberg + DuckDB therefore
+# talk to real AWS using the credentials in .env.localaws.
+#
+# Usage:
+#   cp .env.localaws.example .env.localaws   # then fill in the blanks
+#   docker compose -f docker-compose.localaws.yml up --build -d
+#   # Dagster UI: http://localhost:3000   Gateway: http://localhost:8080
+
+services:
+  metadata-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pipeline
+      POSTGRES_PASSWORD: pipeline
+      POSTGRES_DB: pipeline_metadata
+    volumes:
+      - metadatadata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pipeline -d pipeline_metadata"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.extractor
+    env_file: .env.localaws
+    entrypoint: ["viamedia-migrate"]
+    restart: "no"
+    depends_on:
+      metadata-postgres:
+        condition: service_healthy
+
+  extractor:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.extractor
+    env_file: .env.localaws
+    depends_on:
+      metadata-postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "4000:4000"
+
+  dagster:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dagster-webserver
+    env_file: .env.localaws
+    volumes:
+      # Local compute logs (no S3 compute-logs bucket needed for local runs).
+      - ./docker/dagster.dev.yaml:/app/dagster.yaml:ro
+    depends_on: [extractor]
+    ports:
+      # Dagster's own UI is the engine console (optional); the unified app is on 3000.
+      - "3001:3000"
+
+  daemon:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dagster-webserver
+    env_file: .env.localaws
+    volumes:
+      - ./docker/dagster.dev.yaml:/app/dagster.yaml:ro
+    command: ["dagster-daemon", "run", "-w", "/app/workspace.yaml"]
+    depends_on:
+      metadata-postgres:
+        condition: service_healthy
+      extractor:
+        condition: service_started
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    env_file: .env.localaws
+    environment:
+      GATEWAY_DUCKDB_POOL_SIZE: "2"
+    depends_on:
+      metadata-postgres:
+        condition: service_healthy
+    ports:
+      # The single unified UI. Open http://localhost:3000
+      - "3000:8080"
+
+volumes:
+  metadatadata:

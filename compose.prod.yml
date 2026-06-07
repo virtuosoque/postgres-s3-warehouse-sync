@@ -1,0 +1,79 @@
+# Production docker-compose for the EC2 host. Started by systemd via
+# `viamedia.service` (see DEPLOY.md).
+#
+# Image tags are pulled from .env.images written by cloud-init. Pipeline env
+# (S3 buckets, gateway JWT issuer, etc.) comes from /opt/viamedia/.env.
+#
+# Note: no source-PG container here. Source PG runs externally (RDS or
+# wherever your appdb lives) and is reached via PG_REPLICA_DSN.
+
+version: "3.9"
+
+services:
+  metadata-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pipeline
+      POSTGRES_PASSWORD: ${METADATA_PG_PASSWORD}
+      POSTGRES_DB: pipeline_metadata
+    volumes:
+      - /data/metadata-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pipeline -d pipeline_metadata"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    image: ${EXTRACTOR_IMAGE}
+    restart: "no"
+    env_file: /opt/viamedia/.env
+    entrypoint: ["viamedia-migrate"]
+    depends_on:
+      metadata-postgres:
+        condition: service_healthy
+
+  extractor:
+    image: ${EXTRACTOR_IMAGE}
+    restart: unless-stopped
+    env_file: /opt/viamedia/.env
+    expose: ["4000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  dagster:
+    image: ${DAGSTER_IMAGE}
+    restart: unless-stopped
+    env_file: /opt/viamedia/.env
+    environment:
+      COMPUTE_LOGS_BUCKET: ${COMPUTE_LOGS_BUCKET}
+    ports:
+      - "3000:3000"
+    depends_on: [extractor]
+
+  gateway:
+    image: ${GATEWAY_IMAGE}
+    restart: unless-stopped
+    env_file: /opt/viamedia/.env
+    environment:
+      GATEWAY_DUCKDB_POOL_SIZE: "4"
+    depends_on: [metadata-postgres]
+    expose: ["8080"]
+
+  # Caddy terminates TLS for the gateway. Uses Amazon Linux's instance role
+  # for nothing; certs are obtained via Let's Encrypt or pre-staged.
+  # If you front this with an ALB instead, drop the caddy service and expose
+  # gateway:8080 to the ALB target group.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - /opt/viamedia/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /data/caddy-data:/data
+      - /data/caddy-config:/config
+    depends_on: [gateway]

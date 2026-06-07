@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+.env
+.env.localaws
+.env.*.local
+.dagster/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.log
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+
+# Local data
+data/
+*.parquet
+*.duckdb

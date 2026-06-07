@@ -1,0 +1,11 @@
+# Example Caddyfile for the EC2 host.
+# Upload to /opt/viamedia/Caddyfile via SSM after editing the domain.
+
+lake-api.example.com {
+    reverse_proxy gateway:8080
+    encode zstd gzip
+    log {
+        output stdout
+        format json
+    }
+}

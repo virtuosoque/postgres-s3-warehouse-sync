@@ -1,0 +1,34 @@
+# Dagster instance config (loaded from DAGSTER_HOME).
+# Runs storage is in the metadata Postgres (so it survives container restarts).
+# Compute logs go to S3.
+
+storage:
+  postgres:
+    postgres_url:
+      env: METADATA_PG_DSN
+
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 8
+    tag_concurrency_limits:
+      - key: "kind"
+        value: "incremental"
+        limit: 4
+      - key: "kind"
+        value: "bootstrap"
+        limit: 2
+
+run_launcher:
+  module: dagster.core.launcher
+  class: DefaultRunLauncher
+
+compute_logs:
+  module: dagster_aws.s3.compute_log_manager
+  class: S3ComputeLogManager
+  config:
+    bucket:
+      env: COMPUTE_LOGS_BUCKET
+    prefix: "dagster-compute-logs/"
+    skip_empty_files: true
