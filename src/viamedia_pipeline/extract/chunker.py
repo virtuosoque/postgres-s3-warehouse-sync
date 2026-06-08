@@ -23,6 +23,16 @@ class Chunk:
     chunk_id: int
     lo: int | None = None     # None = no lower bound (full-object chunk)
     hi: int | None = None     # None = no upper bound
+    # Day partitioning: when set, the chunk is scoped to a SINGLE calendar day of
+    # `part_col` so every parquet file it produces has one partition value (a hard
+    # requirement of Iceberg `add_files`). `day` is an ISO date 'YYYY-MM-DD';
+    # `part_tz` True means `part_col` is timestamptz, so day boundaries are UTC.
+    # `day_is_null` selects the rows whose `part_col` IS NULL (Iceberg null
+    # partition). See plan_partitioned_chunks.
+    part_col: str | None = None
+    day: str | None = None
+    part_tz: bool = False
+    day_is_null: bool = False
 
     @property
     def fqn(self) -> str:
@@ -30,7 +40,11 @@ class Chunk:
 
     @property
     def is_full(self) -> bool:
-        return self.lo is None and self.hi is None
+        """No predicate at all: whole object, one COPY (views / no id / no day)."""
+        return (
+            self.lo is None and self.hi is None
+            and self.day is None and not self.day_is_null
+        )
 
 
 def has_leading_index(conn: psycopg.Connection, schema: str, table: str, column: str) -> bool:
@@ -102,6 +116,99 @@ def plan_range_chunks(
         "chunker.planned.range",
         table=f"{schema}.{table}",
         approx_rows=approx_rows, chunks=len(chunks), step=step,
+    )
+    return chunks
+
+
+def _day_expr(part_col: str, part_tz: bool) -> str:
+    """SQL expression yielding the Iceberg `day(part_col)` calendar date.
+
+    Iceberg's DayTransform buckets a `timestamptz` by its UTC date and a plain
+    `timestamp` by its literal date. We MUST group the source identically or a
+    parquet file would straddle two Iceberg partition values and `add_files`
+    would reject it. For timestamptz we therefore convert to UTC first.
+    """
+    col = f'"{part_col}"'
+    return f"({col} AT TIME ZONE 'UTC')::date" if part_tz else f"{col}::date"
+
+
+def plan_partitioned_chunks(
+    conn: psycopg.Connection,
+    schema: str,
+    table: str,
+    part_col: str,
+    *,
+    part_tz: bool,
+    has_numeric_id: bool,
+    rows_per_chunk: int | None = None,
+) -> list[Chunk]:
+    """Chunk so that every chunk (and thus every parquet file) belongs to exactly
+    ONE Iceberg day partition of `part_col`.
+
+    One GROUP BY pass collects, per UTC/literal day, the row count and (when the
+    table has a numeric indexed `id`) the id min/max. Each day is then split into
+    id-range sub-chunks sized to `rows_per_chunk` so big days still parallelize;
+    days with no numeric id become a single per-day COPY. Rows with a NULL
+    partition value get their own chunk (Iceberg's null partition).
+
+    The resulting COPY predicate per chunk is exactly the user's intended shape:
+        WHERE created_at >= 'D' AND created_at < 'D'+1 AND id >= lo AND id < hi
+    (UTC-anchored literals when `part_col` is timestamptz).
+    """
+    target = rows_per_chunk or get_settings().extract_rows_per_chunk
+    day_sql = _day_expr(part_col, part_tz)
+    with conn.cursor() as cur:
+        if has_numeric_id:
+            cur.execute(  # noqa: S608 - identifiers are quoted; day_sql is built locally
+                f'SELECT {day_sql} AS d, count(*) AS n, min(id) AS lo, max(id) AS hi '
+                f'FROM "{schema}"."{table}" GROUP BY 1 ORDER BY 1'
+            )
+        else:
+            cur.execute(  # noqa: S608
+                f'SELECT {day_sql} AS d, count(*) AS n '
+                f'FROM "{schema}"."{table}" GROUP BY 1 ORDER BY 1'
+            )
+        rows = cur.fetchall()
+
+    def _get(r, key, idx):
+        return r[key] if isinstance(r, dict) else r[idx]
+
+    chunks: list[Chunk] = []
+    cid = 0
+    for r in rows:
+        d = _get(r, "d", 0)
+        n = _get(r, "n", 1) or 0
+        day_iso = d.isoformat() if d is not None else None
+        is_null = d is None
+        if not has_numeric_id or is_null:
+            # One COPY for the whole day (or the null-partition group).
+            chunks.append(Chunk(
+                schema=schema, table=table, chunk_id=cid,
+                part_col=part_col, day=day_iso, part_tz=part_tz, day_is_null=is_null,
+            ))
+            cid += 1
+            continue
+        lo = _get(r, "lo", 2)
+        hi = _get(r, "hi", 3)
+        if lo is None or hi is None:
+            continue
+        n_sub = max(1, n // target)
+        span = hi - lo + 1
+        step = max(1, span // n_sub)
+        cur_lo = lo
+        while cur_lo <= hi:
+            nxt = cur_lo + step
+            chunks.append(Chunk(
+                schema=schema, table=table, chunk_id=cid,
+                lo=cur_lo, hi=nxt if nxt <= hi else hi + 1,
+                part_col=part_col, day=day_iso, part_tz=part_tz,
+            ))
+            cur_lo = nxt
+            cid += 1
+    log.info(
+        "chunker.planned.partitioned",
+        table=f"{schema}.{table}", part_col=part_col, part_tz=part_tz,
+        days=len(rows), chunks=len(chunks),
     )
     return chunks
 

@@ -116,6 +116,7 @@ async function renderConnections(){
         el("td",{},c.iceberg_namespace),el("td",{},c.lake_bucket),
         el("td",{html:c.enabled?'<span class="ok">yes</span>':'<span class="muted">no</span>'}),
         el("td",{},el("button",{class:"btn alt",onclick:()=>fillForm(c)},"Edit"),
+                  el("button",{class:"btn danger",style:"margin-left:6px",onclick:()=>wipeConn(c)},"Wipe data"),
                   el("button",{class:"btn danger",style:"margin-left:6px",onclick:()=>delConn(c.id)},"Delete")))));
       listCard.append(t);}
   }catch(e){listCard.innerHTML="";listCard.append(el("div",{class:"bad"},String(e)));}
@@ -163,6 +164,12 @@ async function saveConn(){const id=$("#f_id").value;const m=$("#connMsg");m.text
   try{if(id)await api("PUT","/connections/"+id,formBody());else await api("POST","/connections",formBody());
     m.innerHTML='<span class="ok">saved</span>';renderConnections();}catch(e){m.innerHTML='<span class="bad">not saved — '+e+'</span>';}}
 async function delConn(id){if(!confirm("Delete connection "+id+"? (does NOT delete S3 data)"))return;try{await api("DELETE","/connections/"+id);renderConnections();}catch(e){alert(e);}}
+async function wipeConn(c){
+  if(!confirm("WIPE ALL DATA for '"+c.name+"'?\n\nThis DROPS every Iceberg table, DELETES the S3 folders (raw/ curated/ gateway-results/) in bucket '"+c.lake_bucket+"', clears watermarks + chunk state, and deletes all Dagster runs for this connection.\n\nThe connection details and your object selection are KEPT, so you can re-sync from scratch.\n\nThis cannot be undone."))return;
+  if(prompt("Type the connection name to confirm wipe:")!==c.name){alert("Name did not match — wipe cancelled.");return;}
+  try{const r=await api("POST","/connections/"+c.id+"/wipe",{});
+    alert("Wiped '"+c.name+"':\n  tables dropped: "+r.tables_dropped+"\n  S3 objects deleted: "+r.s3_objects_deleted+"\n  runs deleted: "+r.runs_deleted);
+    renderConnections();}catch(e){alert("Wipe failed: "+e);}}
 
 /* ---------- Sync ---------- */
 async function renderSync(){

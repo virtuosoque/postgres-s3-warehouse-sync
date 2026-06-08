@@ -40,6 +40,27 @@ def s3_client(conn: Connection):
     return client
 
 
+def delete_prefix(conn: Connection, prefix: str) -> int:
+    """Delete every object under `prefix` in the connection's lake bucket.
+    Returns the number of objects deleted."""
+    cli = s3_client(conn)
+    bucket = conn.lake_bucket
+    paginator = cli.get_paginator("list_objects_v2")
+    total = 0
+    batch: list[dict] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            batch.append({"Key": obj["Key"]})
+            if len(batch) >= 1000:
+                cli.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+                total += len(batch)
+                batch = []
+    if batch:
+        cli.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+        total += len(batch)
+    return total
+
+
 def put_sse_args() -> dict:
     """ExtraArgs for SSE-S3 (AES256). Bucket-default encryption also applies,
     but passing this explicitly fails fast if a request would land unencrypted."""

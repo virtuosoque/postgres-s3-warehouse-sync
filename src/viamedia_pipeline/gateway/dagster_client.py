@@ -120,6 +120,44 @@ query($f: RunsFilter!, $limit: Int!) {
 """
 
 
+_TERMINATE = "mutation($id: String!){ terminateRun(runId: $id){ __typename } }"
+_DELETE = "mutation($id: String!){ deletePipelineRun(runId: $id){ __typename ... on PythonError { message } } }"
+
+
+def _post(query: str, variables: dict) -> dict:
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(_graphql_url(), json={"query": query, "variables": variables})
+        resp.raise_for_status()
+        return resp.json()
+
+
+def delete_runs(connection_id: int) -> int:
+    """Terminate (if running) + delete every Dagster run tagged for this
+    connection. Best-effort; loops until none remain."""
+    deleted = 0
+    for _ in range(200):  # safety bound
+        runs = recent_runs(connection_id, limit=100)
+        if not runs:
+            break
+        progressed = False
+        for r in runs:
+            rid = r["runId"]
+            try:
+                _post(_TERMINATE, {"id": rid})
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _post(_DELETE, {"id": rid})
+                deleted += 1
+                progressed = True
+            except Exception:  # noqa: BLE001
+                pass
+        if not progressed:
+            break
+    log.info("dagster.runs.deleted", connection_id=connection_id, count=deleted)
+    return deleted
+
+
 def recent_runs(connection_id: int, limit: int = 25) -> list[dict]:
     """Recent runs for a connection (runs are tagged connection=<id>)."""
     variables = {"f": {"tags": [{"key": "connection", "value": str(connection_id)}]}, "limit": limit}

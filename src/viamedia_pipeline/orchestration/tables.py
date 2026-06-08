@@ -55,9 +55,26 @@ class TableOverride:
 OVERRIDES: dict[str, TableOverride] = {}
 
 
+_PARTITION_TIMESTAMP_TYPES = (
+    "timestamp without time zone",
+    "timestamp with time zone",
+)
+
+
 def _default_partition_for(obj: DiscoveredObject) -> tuple[tuple[str, str, int | None], ...]:
-    """add_files-compatible default: day(created_at) if present, else unpartitioned."""
-    if "created_at" in obj.column_names:
+    """Partition by `day(created_at)` when the object has a timestamp
+    `created_at`; otherwise leave it unpartitioned.
+
+    We load via PyIceberg `add_files` (zero-copy), which requires every file to
+    belong to a SINGLE partition value. The bootstrap planner
+    (`plan_partitioned_chunks`) therefore slices each object into one-day
+    (and id-range) chunks so each parquet file carries exactly one day -> the
+    partitioned table accepts them. Day partitioning lets Athena/DuckDB/PowerBI
+    prune by date cheaply. Objects without a timestamp `created_at` (views,
+    lookup tables) stay unpartitioned and rely on per-file min/max stats.
+    """
+    col = next((c for c in obj.columns if c.name == "created_at"), None)
+    if col is not None and col.pg_type.lower() in _PARTITION_TIMESTAMP_TYPES:
         return (("created_at", "day", None),)
     return ()
 

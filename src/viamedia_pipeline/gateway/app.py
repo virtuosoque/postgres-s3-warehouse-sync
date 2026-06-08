@@ -222,6 +222,41 @@ def delete_connection(connection_id: int, principal: Principal = Depends(current
     return {"deleted": connection_id}
 
 
+@app.post("/connections/{connection_id}/wipe")
+def wipe_connection(connection_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    """Delete ALL synced data for a connection but KEEP the connection record
+    (and its object selection): drops the Iceberg tables, deletes the S3 lake
+    folders, clears watermarks/chunk-state, and deletes the connection's Dagster
+    runs. Lets you start that connection fresh without re-entering credentials."""
+    conn = config_store.get_connection(connection_id)
+    if conn is None:
+        raise HTTPException(404, "connection not found")
+
+    from viamedia_pipeline.common.metadata_db import connection as md_connection
+    from viamedia_pipeline.common.s3 import delete_prefix
+    from viamedia_pipeline.load.iceberg_writer import drop_all_tables
+
+    tables_dropped = drop_all_tables(conn)
+
+    s3_deleted = 0
+    for prefix in ("raw/", "curated/", "gateway-results/"):
+        try:
+            s3_deleted += delete_prefix(conn, prefix)
+        except Exception as e:  # noqa: BLE001
+            log.warning("wipe.s3_failed", connection_id=connection_id, prefix=prefix, error=str(e))
+
+    with md_connection() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM pipeline_watermarks WHERE connection_id = %s", (connection_id,))
+        cur.execute("DELETE FROM pipeline_chunk_state WHERE connection_id = %s", (connection_id,))
+        c.commit()
+
+    runs_deleted = dagster_client.delete_runs(connection_id)
+    config_store.invalidate_cache()
+    log.info("connection.wiped", connection_id=connection_id,
+             tables=tables_dropped, s3_objects=s3_deleted, runs=runs_deleted)
+    return {"tables_dropped": tables_dropped, "s3_objects_deleted": s3_deleted, "runs_deleted": runs_deleted}
+
+
 @app.post("/connections/test")
 def test_connection(body: ConnectionIn, principal: Principal = Depends(current_principal)) -> dict:
     """Test DB + AWS without saving. Returns each result so the UI can show both."""

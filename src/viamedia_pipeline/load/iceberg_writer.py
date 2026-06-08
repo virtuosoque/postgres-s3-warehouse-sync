@@ -151,6 +151,32 @@ def _s3_object_exists(conn: Connection, s3_uri: str) -> bool:
         return False
 
 
+def drop_all_tables(conn: Connection) -> int:
+    """Drop every Iceberg table in this connection's namespace from the catalog
+    (does NOT delete the S3 data files — the caller handles S3). Returns count."""
+    cat = catalog(conn)
+    try:
+        idents = list(cat.list_tables(conn.iceberg_namespace))
+    except Exception:  # noqa: BLE001
+        idents = []
+    n = 0
+    for ident in idents:
+        name = ident[-1] if isinstance(ident, tuple) else str(ident).split(".")[-1]
+        _drop_catalog_entry(conn, cat, name)
+        n += 1
+    # also clear the namespace's property row (best-effort)
+    try:
+        with metadata_connection() as c, c.cursor() as cur:
+            cur.execute(
+                "DELETE FROM iceberg_namespace_properties WHERE catalog_name = %s AND namespace = %s",
+                (get_settings().iceberg_catalog_name, conn.iceberg_namespace),
+            )
+            c.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
 def _drop_catalog_entry(conn: Connection, cat: Catalog, table: str) -> None:
     """Remove a stale catalog row (does NOT touch S3 data)."""
     ident = (conn.iceberg_namespace, table)

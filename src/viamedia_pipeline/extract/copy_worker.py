@@ -101,23 +101,35 @@ def extract_chunk_to_s3(
     s = get_settings()
     s3 = s3_client(conn_cfg)
 
-    # Build COPY SQL with safely-quoted identifiers. Full-object chunks (views,
-    # objects without numeric id) skip the WHERE clause entirely.
-    if chunk.is_full:
-        where_clause: sql.Composable | None = (
-            sql.SQL(where_extra) if where_extra else None  # caller-trusted
-        )
-    else:
-        base_where = sql.SQL("id >= {lo} AND id < {hi}").format(
-            lo=sql.Literal(chunk.lo), hi=sql.Literal(chunk.hi)
-        )
-        where_clause = (
-            sql.SQL("({base}) AND ({extra})").format(
-                base=base_where, extra=sql.SQL(where_extra)  # caller-trusted
-            )
-            if where_extra
-            else base_where
-        )
+    # Build the COPY WHERE from independent predicates so day-partition scoping
+    # and id-range scoping compose. Each predicate is built with quoted
+    # identifiers / literals; `where_extra` is caller-trusted.
+    preds: list[sql.Composable] = []
+    if chunk.day_is_null and chunk.part_col:
+        # The Iceberg null partition: rows whose partition column IS NULL.
+        preds.append(sql.SQL("{col} IS NULL").format(col=sql.Identifier(chunk.part_col)))
+    elif chunk.day and chunk.part_col:
+        # Single calendar day. For timestamptz, anchor the boundaries at UTC
+        # midnight so the source day matches Iceberg's UTC DayTransform; for a
+        # plain timestamp, use naive midnight (literal-date semantics).
+        col = sql.Identifier(chunk.part_col)
+        if chunk.part_tz:
+            lo_lit = sql.SQL("({d}::date)::timestamp AT TIME ZONE 'UTC'").format(d=sql.Literal(chunk.day))
+            hi_lit = sql.SQL("(({d}::date + 1))::timestamp AT TIME ZONE 'UTC'").format(d=sql.Literal(chunk.day))
+        else:
+            lo_lit = sql.SQL("({d}::date)::timestamp").format(d=sql.Literal(chunk.day))
+            hi_lit = sql.SQL("(({d}::date + 1))::timestamp").format(d=sql.Literal(chunk.day))
+        preds.append(sql.SQL("{col} >= {lo} AND {col} < {hi}").format(col=col, lo=lo_lit, hi=hi_lit))
+    if chunk.lo is not None:
+        preds.append(sql.SQL("id >= {lo}").format(lo=sql.Literal(chunk.lo)))
+    if chunk.hi is not None:
+        preds.append(sql.SQL("id < {hi}").format(hi=sql.Literal(chunk.hi)))
+    if where_extra:
+        preds.append(sql.SQL("({extra})").format(extra=sql.SQL(where_extra)))  # caller-trusted
+
+    where_clause: sql.Composable | None = (
+        sql.SQL(" AND ").join(preds) if preds else None
+    )
 
     if where_clause is None:
         copy_stmt = sql.SQL("COPY (SELECT * FROM {tbl}) TO STDOUT (FORMAT BINARY)").format(

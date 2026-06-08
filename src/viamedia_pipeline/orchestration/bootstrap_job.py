@@ -35,6 +35,7 @@ from viamedia_pipeline.extract.chunker import (
     Chunk,
     has_leading_index,
     plan_full_chunk,
+    plan_partitioned_chunks,
     plan_range_chunks,
 )
 from viamedia_pipeline.extract.copy_worker import extract_chunk_to_s3
@@ -88,7 +89,27 @@ def plan_bootstrap(context: OpExecutionContext):
         evolve_table_schema(conn, cfg.iceberg_table_name, iceberg_schema)
         # Parallel id-range chunking only pays off when the key is indexed;
         # otherwise each chunk would full-scan the table, so stream one COPY.
-        if cfg.supports_parallel_chunking and has_leading_index(pg_conn, cfg.schema, cfg.table, cfg.pk):
+        numeric_id = cfg.supports_parallel_chunking and has_leading_index(
+            pg_conn, cfg.schema, cfg.table, cfg.pk
+        )
+        # A day-partitioned table MUST be chunked one-day-per-file (add_files
+        # rejects multi-day files), so use the partition-aware planner whenever
+        # the table has a day() partition -- regardless of numeric id (days with
+        # no numeric id become a single per-day COPY).
+        day_part = next((p for p in cfg.partition_by if p[1] == "day"), None)
+        if day_part is not None:
+            part_col = day_part[0]
+            pcol = next((c for c in cols if c.name == part_col), None)
+            part_tz = pcol is not None and "with time zone" in pcol.pg_type.lower()
+            context.log.info(
+                f"bootstrap.partitioned table={fqn} part_col={part_col} "
+                f"tz={part_tz} numeric_id={numeric_id}"
+            )
+            chunks = plan_partitioned_chunks(
+                pg_conn, cfg.schema, cfg.table, part_col,
+                part_tz=part_tz, has_numeric_id=numeric_id,
+            )
+        elif numeric_id:
             chunks = plan_range_chunks(pg_conn, cfg.schema, cfg.table)
         else:
             context.log.info(f"bootstrap.single_copy table={fqn} reason=pk_not_indexed_or_non_numeric")
