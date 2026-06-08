@@ -6,6 +6,7 @@ own AWS credentials, so we build/cache one catalog per connection.
 """
 
 import os
+import time
 
 from pyiceberg.catalog import Catalog, load_catalog
 from pyiceberg.exceptions import NoSuchTableError
@@ -85,10 +86,11 @@ def create_or_get_table(
     cat = catalog(conn)
     ident = (conn.iceberg_namespace, table)
 
+    existing: Table | None
     try:
-        return cat.load_table(ident)
+        existing = cat.load_table(ident)
     except NoSuchTableError:
-        pass  # genuinely new -> create below
+        existing = None  # genuinely new -> create below
     except Exception as e:  # noqa: BLE001
         # Registered in the catalog but its metadata couldn't be loaded. If the
         # metadata.json is *confirmed missing* in S3 (e.g. the bucket folder was
@@ -100,8 +102,26 @@ def create_or_get_table(
             log.warning("iceberg.table.orphaned_recreating",
                         table=f"{conn.iceberg_namespace}.{table}", metadata=loc)
             _drop_catalog_entry(conn, cat, table)
+            existing = None
         else:
             raise
+
+    if existing is not None:
+        # Reconcile the PARTITION SPEC. The existing table may have been created
+        # by an older config (e.g. day-partitioned) that no longer matches how we
+        # now chunk/extract. add_files would then reject our files ("more than one
+        # partition value"). Bootstrap is a full reload, so on a mismatch we drop
+        # and recreate with the current spec rather than fail at commit time.
+        desired_sig = {(col, tname) for (col, tname, _n) in (partition_by or [])}
+        actual_sig = _table_spec_signature(existing)
+        if desired_sig == actual_sig:
+            return existing
+        log.warning(
+            "iceberg.table.spec_mismatch_recreating",
+            table=f"{conn.iceberg_namespace}.{table}",
+            existing=sorted(actual_sig), desired=sorted(desired_sig),
+        )
+        _drop_catalog_entry(conn, cat, table)
 
     spec = _build_partition_spec(iceberg_schema, partition_by or [])
     props = {
@@ -197,6 +217,32 @@ def _drop_catalog_entry(conn: Connection, cat: Catalog, table: str) -> None:
         log.warning("iceberg.catalog_entry.delete_failed", table=table, error=str(e))
 
 
+_TRANSFORM_CLASS_TO_NAME = {
+    "IdentityTransform": "identity",
+    "DayTransform": "day",
+    "MonthTransform": "month",
+    "YearTransform": "year",
+    "HourTransform": "hour",
+    "BucketTransform": "bucket",
+    "TruncateTransform": "truncate",
+}
+
+
+def _table_spec_signature(tbl: Table) -> set[tuple[str, str]]:
+    """{(source_column_name, transform_name)} for the table's CURRENT partition
+    spec, comparable against a desired partition_by config (ignores partition
+    field ids/names, which differ between create calls)."""
+    schema = tbl.schema()
+    sig: set[tuple[str, str]] = set()
+    for f in tbl.spec().fields:
+        name = schema.find_column_name(f.source_id) or str(f.source_id)
+        tname = _TRANSFORM_CLASS_TO_NAME.get(
+            type(f.transform).__name__, type(f.transform).__name__.lower()
+        )
+        sig.add((name, tname))
+    return sig
+
+
 def _build_partition_spec(
     schema: IcebergSchema,
     partition_by: list[tuple[str, str, int | None]],
@@ -232,6 +278,48 @@ def commit_parquet_files(table: Table, s3_uris: list[str]) -> None:
         return
     table.add_files(file_paths=s3_uris)
     log.info("iceberg.commit.success", n_files=len(s3_uris))
+
+
+def commit_files_with_retry(
+    conn: Connection,
+    iceberg_table_name: str,
+    s3_uris: list[str],
+    *,
+    max_attempts: int = 10,
+) -> None:
+    """Register `s3_uris` into the table via add_files, reloading + retrying on
+    Iceberg commit conflicts.
+
+    With per-chunk commits, many parallel workers commit to the SAME table
+    concurrently. The SqlCatalog commit is an optimistic compare-and-swap on the
+    metadata row, so concurrent commits race -- the losers raise
+    CommitFailedException and must reload the latest table metadata and retry.
+    Each add_files is its own atomic snapshot, so retrying is safe (no partial
+    state); the only thing we must NOT do is re-add the same files twice, which
+    the caller guards via chunk-state idempotency.
+    """
+    if not s3_uris:
+        return
+    from pyiceberg.exceptions import CommitFailedException
+
+    cat = catalog(conn)
+    ident = (conn.iceberg_namespace, iceberg_table_name)
+    last_err: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            tbl = cat.load_table(ident)  # always commit against latest metadata
+            tbl.add_files(file_paths=s3_uris)
+            log.info("iceberg.commit.success", table=iceberg_table_name,
+                     n_files=len(s3_uris), attempt=attempt)
+            return
+        except CommitFailedException as e:
+            last_err = e
+            time.sleep(min(0.4 * (attempt + 1), 5.0))  # linear backoff, capped
+            log.warning("iceberg.commit.conflict_retry",
+                        table=iceberg_table_name, attempt=attempt, error=str(e))
+    raise RuntimeError(
+        f"add_files failed after {max_attempts} attempts for {iceberg_table_name}"
+    ) from last_err
 
 
 def evolve_table_schema(conn: Connection, table: str, source_schema: IcebergSchema) -> Table:

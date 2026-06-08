@@ -55,12 +55,6 @@ class TableOverride:
 OVERRIDES: dict[str, TableOverride] = {}
 
 
-_PARTITION_TIMESTAMP_TYPES = (
-    "timestamp without time zone",
-    "timestamp with time zone",
-)
-
-
 def _default_partition_for(obj: DiscoveredObject) -> tuple[tuple[str, str, int | None], ...]:
     """Partition by `day(created_at)` when the object has a timestamp
     `created_at`; otherwise leave it unpartitioned.
@@ -74,7 +68,10 @@ def _default_partition_for(obj: DiscoveredObject) -> tuple[tuple[str, str, int |
     lookup tables) stay unpartitioned and rely on per-file min/max stats.
     """
     col = next((c for c in obj.columns if c.name == "created_at"), None)
-    if col is not None and col.pg_type.lower() in _PARTITION_TIMESTAMP_TYPES:
+    # format_type() yields "timestamp without time zone" / "timestamp with time
+    # zone" (optionally with a precision, e.g. "timestamp(3) with time zone").
+    # A prefix check covers all timestamp variants while excluding plain `date`.
+    if col is not None and col.pg_type.lower().startswith("timestamp"):
         return (("created_at", "day", None),)
     return ()
 

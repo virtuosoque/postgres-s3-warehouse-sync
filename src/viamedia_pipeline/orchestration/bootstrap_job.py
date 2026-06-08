@@ -47,8 +47,7 @@ from viamedia_pipeline.extract.schema import (
 )
 from viamedia_pipeline.extract.snapshot import export_snapshot
 from viamedia_pipeline.load.iceberg_writer import (
-    catalog,
-    commit_parquet_files,
+    commit_files_with_retry,
     create_or_get_table,
     ensure_namespace,
     evolve_table_schema,
@@ -150,7 +149,16 @@ def extract_chunk_op(context: OpExecutionContext, payload: dict) -> dict:
     snapshot_id: str = payload["snapshot_id"]
     arrow_schema = pa.ipc.read_schema(pa.BufferReader(payload["arrow_schema_serialized"]))
     run_id: str = payload["run_id"]
+    iceberg_table_name: str = payload["iceberg_table_name"]
     key = chunk_state.chunk_key(c.fqn, c.chunk_id)
+
+    # Idempotency under op retries: if a previous attempt already extracted AND
+    # committed this chunk, do not extract/commit again (add_files does not dedup
+    # -- re-committing would duplicate rows).
+    if key in chunk_state.list_done(run_id):
+        context.log.info(f"chunk.skip_already_committed key={key}")
+        return {"connection_id": connection_id, "s3_uris": [], "rows": 0,
+                "iceberg_table_name": iceberg_table_name}
 
     chunk_state.put(chunk_state.ChunkRecord(
         run_id=run_id, chunk_key=key, connection_id=connection_id, status="RUNNING"))
@@ -161,6 +169,11 @@ def extract_chunk_op(context: OpExecutionContext, payload: dict) -> dict:
             arrow_schema=arrow_schema, s3_prefix=s3_prefix,
             pg_oids=payload.get("pg_oids"),
         )
+        # Commit THIS chunk's files now (per-chunk), so the table fills up live
+        # and a single bad chunk fails only itself. Retries on Iceberg commit
+        # conflicts (many workers commit concurrently). Mark DONE only after the
+        # commit succeeds so the idempotency guard above is accurate.
+        commit_files_with_retry(conn, iceberg_table_name, res.s3_uris)
         chunk_state.put(chunk_state.ChunkRecord(
             run_id=run_id, chunk_key=key, connection_id=connection_id, status="DONE",
             s3_uri=(res.s3_uris[0] if res.s3_uris else None), rows=res.rows,
@@ -169,7 +182,7 @@ def extract_chunk_op(context: OpExecutionContext, payload: dict) -> dict:
             "connection_id": connection_id,
             "s3_uris": res.s3_uris,
             "rows": res.rows,
-            "iceberg_table_name": payload["iceberg_table_name"],
+            "iceberg_table_name": iceberg_table_name,
         }
     except Exception as e:
         chunk_state.put(chunk_state.ChunkRecord(
@@ -181,23 +194,22 @@ def extract_chunk_op(context: OpExecutionContext, payload: dict) -> dict:
 
 @op
 def commit_chunks(context: OpExecutionContext, results: list[dict]) -> dict:
+    """Finalizer/summary. Files are committed per-chunk in extract_chunk_op
+    (so the table is queryable progressively); here we just total up the run."""
+    results = [r for r in results if r]
     if not results:
-        context.log.warning("bootstrap.no_chunks_to_commit")
+        context.log.warning("bootstrap.no_chunks")
         return {"rows": 0, "files": 0}
 
     connection_id = results[0]["connection_id"]
     iceberg_table_name = results[0]["iceberg_table_name"]
-    conn = _require_connection(connection_id)
-    tbl = catalog(conn).load_table((conn.iceberg_namespace, iceberg_table_name))
-    s3_uris = [u for r in results for u in r.get("s3_uris", [])]
+    total_files = sum(len(r.get("s3_uris", [])) for r in results)
     total_rows = sum(r["rows"] for r in results)
-
-    commit_parquet_files(tbl, s3_uris)
     context.log.info(
-        f"bootstrap.commit conn={connection_id} table={iceberg_table_name} "
-        f"files={len(s3_uris)} rows={total_rows} ts={datetime.now(timezone.utc).isoformat()}"
+        f"bootstrap.done conn={connection_id} table={iceberg_table_name} "
+        f"files={total_files} rows={total_rows} ts={datetime.now(timezone.utc).isoformat()}"
     )
-    return {"rows": total_rows, "files": len(s3_uris)}
+    return {"rows": total_rows, "files": total_files}
 
 
 @job(
