@@ -25,7 +25,7 @@ UI_HTML = r"""<!doctype html>
              padding:8px 14px;border-radius:8px;cursor:pointer;font-size:14px}
   nav button.active{background:var(--purple);color:#fff}
   nav button:hover:not(.active){background:var(--navy2);color:#fff}
-  main{padding:20px 22px;max-width:1180px}
+  main{padding:20px 28px;width:100%}
   h2{font-family:Poppins;font-weight:600;font-size:15px;color:var(--purple2);margin:0 0 12px;text-transform:uppercase;letter-spacing:.5px}
   h3{font-family:Poppins;font-weight:600;font-size:13px;margin:14px 0 6px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
@@ -43,6 +43,7 @@ UI_HTML = r"""<!doctype html>
   th{font-family:Poppins;font-weight:600;text-align:left;padding:8px 10px;border-bottom:2px solid var(--yellow);white-space:nowrap}
   th .coltype{font-family:Raleway;font-weight:400;font-size:11px;color:var(--yellow)}
   td{padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap;max-width:340px;overflow:hidden;text-overflow:ellipsis}
+  td.act{max-width:none;overflow:visible}
   .muted{color:var(--gray)} .ok{color:var(--green)} .bad{color:#ff9db1} .yell{color:var(--yellow)}
   .pill{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;border:1px solid var(--line);color:var(--gray);margin-left:6px}
   .pill.inc{border-color:var(--purple);color:var(--purple2)}
@@ -115,7 +116,7 @@ async function renderConnections(){
       CONNS.forEach(c=>t.append(el("tr",{},el("td",{},c.name),el("td",{},c.db_host+":"+c.db_port),el("td",{},c.db_name),
         el("td",{},c.iceberg_namespace),el("td",{},c.lake_bucket),
         el("td",{html:c.enabled?'<span class="ok">yes</span>':'<span class="muted">no</span>'}),
-        el("td",{},el("button",{class:"btn alt",onclick:()=>fillForm(c)},"Edit"),
+        el("td",{class:"act"},el("button",{class:"btn alt",onclick:()=>fillForm(c)},"Edit"),
                   el("button",{class:"btn danger",style:"margin-left:6px",onclick:()=>wipeConn(c)},"Wipe data"),
                   el("button",{class:"btn danger",style:"margin-left:6px",onclick:()=>delConn(c.id)},"Delete")))));
       listCard.append(t);}

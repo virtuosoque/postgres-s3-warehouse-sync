@@ -42,16 +42,32 @@ def refresh_once() -> int:
     def _apply(dconn) -> None:
         for c, tables in per_conn:
             register_connection_secret(dconn, c)
-            dconn.execute(f'CREATE SCHEMA IF NOT EXISTS "{c.iceberg_namespace}";')
+            ns = c.iceberg_namespace
+            dconn.execute(f'CREATE SCHEMA IF NOT EXISTS "{ns}";')
+            desired: set[str] = set()
             for name, meta_loc in tables:
+                desired.add(name)
                 try:
                     dconn.execute(
-                        f'CREATE OR REPLACE VIEW "{c.iceberg_namespace}"."{name}" AS '
+                        f'CREATE OR REPLACE VIEW "{ns}"."{name}" AS '
                         f"SELECT * FROM iceberg_scan('{meta_loc}');"
                     )
                 except Exception as e:
                     log.warning("refresher.view_create_failed",
                                 connection_id=c.id, table=name, error=str(e))
+            # Prune views whose Iceberg table no longer exists (dropped, wiped,
+            # or de-selected) so the Query page never lists stale tables.
+            try:
+                existing = dconn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = ? AND table_type = 'VIEW'",
+                    [ns],
+                ).fetchall()
+                for (vname,) in existing:
+                    if vname not in desired:
+                        dconn.execute(f'DROP VIEW IF EXISTS "{ns}"."{vname}";')
+            except Exception as e:
+                log.warning("refresher.prune_failed", connection_id=c.id, error=str(e))
 
     total = sum(len(t) for _, t in per_conn)
     if total or conns:

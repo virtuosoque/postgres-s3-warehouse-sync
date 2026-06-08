@@ -308,6 +308,15 @@ def wipe_connection(connection_id: int, principal: Principal = Depends(current_p
         cur.execute("DELETE FROM pipeline_chunk_state WHERE connection_id = %s", (connection_id,))
         c.commit()
 
+    # Drop the connection's DuckDB views now (every pooled connection) so the
+    # Query page stops listing wiped tables immediately, rather than waiting for
+    # the next background view refresh.
+    try:
+        ns = conn.iceberg_namespace
+        get_pool().for_each(lambda d, ns=ns: d.execute(f'DROP SCHEMA IF EXISTS "{ns}" CASCADE;'))
+    except Exception as e:  # noqa: BLE001
+        log.warning("wipe.duckdb_drop_failed", connection_id=connection_id, error=str(e))
+
     runs_deleted = dagster_client.delete_runs(connection_id)
     config_store.invalidate_cache()
     log.info("connection.wiped", connection_id=connection_id,

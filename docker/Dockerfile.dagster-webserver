@@ -2,18 +2,28 @@ FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends libpq5 ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# 1) pip/wheel upgrade -- its own layer; only the base image can invalidate it.
+RUN pip install --upgrade pip wheel
+
+# 2) Third-party dependencies -- cached until pyproject.toml changes (NOT on
+#    every source edit). A stub package lets the editable build resolve project
+#    metadata without the real source tree present yet.
 COPY pyproject.toml README.md ./
+RUN mkdir -p src/viamedia_pipeline && touch src/viamedia_pipeline/__init__.py
+RUN pip install -e ".[gateway]"
+
+# 3) Real source + Dagster config -- ONLY these rebuild on a code change.
 COPY src ./src
 COPY docker/dagster.yaml ./dagster.yaml
 COPY docker/workspace.yaml ./workspace.yaml
-
-RUN pip install --upgrade pip wheel && pip install -e ".[gateway]"
 
 ENV DAGSTER_HOME=/app
 ENV PYTHONPATH=/app/src
