@@ -10,7 +10,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter
@@ -506,12 +506,13 @@ class QueryStatus(BaseModel):
 
 
 @app.post("/queries", response_model=QuerySubmitted)
-@limiter.limit("10/minute")
-async def submit_query(request: Request, body: QueryRequest,
+async def submit_query(body: QueryRequest,
                        principal: Principal = Depends(current_principal)) -> QuerySubmitted:
-    # `request: Request` (Starlette) is REQUIRED by slowapi's @limiter.limit to
-    # read the client IP. The query body is `body`. (Previously the body was
-    # named `request`, so slowapi tried `.client` on it -> 500 on every call.)
+    # NOTE: rate limiting was removed here. The installed slowapi calls the
+    # limiter key_func with no args (`lim.key_func()`), which is incompatible with
+    # a key_func that takes the request -> every call 500'd. For a self-hosted,
+    # SQL-guarded gateway, per-endpoint rate limiting isn't essential; if needed,
+    # enforce it at a reverse proxy (nginx/Caddy) or pin a compatible slowapi.
     try:
         safe_sql = guard(body.sql)
     except SqlGuardError as e:
