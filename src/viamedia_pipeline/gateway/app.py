@@ -10,7 +10,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter
@@ -507,10 +507,13 @@ class QueryStatus(BaseModel):
 
 @app.post("/queries", response_model=QuerySubmitted)
 @limiter.limit("10/minute")
-async def submit_query(request: QueryRequest,
+async def submit_query(request: Request, body: QueryRequest,
                        principal: Principal = Depends(current_principal)) -> QuerySubmitted:
+    # `request: Request` (Starlette) is REQUIRED by slowapi's @limiter.limit to
+    # read the client IP. The query body is `body`. (Previously the body was
+    # named `request`, so slowapi tried `.client` on it -> 500 on every call.)
     try:
-        safe_sql = guard(request.sql)
+        safe_sql = guard(body.sql)
     except SqlGuardError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
     job = q.submit(safe_sql, principal_sub=principal.sub)
