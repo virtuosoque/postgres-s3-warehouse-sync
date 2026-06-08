@@ -153,21 +153,77 @@ def _test_db(dsn: str) -> str | None:
     return None
 
 
-def _test_aws(ak: str | None, sk: str | None, region: str, bucket: str) -> str | None:
+def _s3_admin_client(ak: str | None, sk: str | None, region: str):
+    """A bare boto3 S3 client for connection test / bucket provisioning, built
+    from the supplied creds (LocalStack endpoint + path-style when set)."""
     import os
 
     import boto3
     from botocore.config import Config as BotoConfig
+
+    kw: dict = {"region_name": region}
+    if ak and sk:
+        kw["aws_access_key_id"] = ak
+        kw["aws_secret_access_key"] = sk
+    endpoint = os.environ.get("AWS_ENDPOINT_URL")
+    if endpoint:
+        kw["endpoint_url"] = endpoint
+        kw["config"] = BotoConfig(s3={"addressing_style": "path"})
+    return boto3.client("s3", **kw)
+
+
+def _bucket_missing(err) -> bool:
+    """True if a ClientError means the bucket simply doesn't exist yet (vs. a
+    creds/permission failure). A 404 also proves the creds authenticated."""
+    resp = getattr(err, "response", {}) or {}
+    code = resp.get("Error", {}).get("Code", "")
+    status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code in ("404", "NoSuchBucket") or status == 404
+
+
+def _test_aws(ak: str | None, sk: str | None, region: str, bucket: str) -> str | None:
+    """Validate AWS creds WITHOUT requiring the bucket to pre-exist. A missing
+    bucket is not an error here -- it will be created on save."""
+    from botocore.exceptions import ClientError
     try:
-        kw: dict = {"region_name": region}
-        if ak and sk:
-            kw["aws_access_key_id"] = ak
-            kw["aws_secret_access_key"] = sk
-        endpoint = os.environ.get("AWS_ENDPOINT_URL")
-        if endpoint:
-            kw["endpoint_url"] = endpoint
-            kw["config"] = BotoConfig(s3={"addressing_style": "path"})
-        boto3.client("s3", **kw).head_bucket(Bucket=bucket)
+        cli = _s3_admin_client(ak, sk, region)
+        try:
+            cli.head_bucket(Bucket=bucket)
+        except ClientError as e:
+            if _bucket_missing(e):
+                return None  # creds OK; bucket will be created when you save
+            return str(e)
+    except Exception as e:  # noqa: BLE001
+        return str(e)
+    return None
+
+
+def _ensure_bucket(ak: str | None, sk: str | None, region: str, bucket: str) -> str | None:
+    """Create the lake bucket if it doesn't exist (idempotent). Returns an error
+    string if the creds are bad or the bucket can't be created/accessed -- the
+    caller refuses to save the connection in that case."""
+    import os
+
+    from botocore.exceptions import ClientError
+    try:
+        cli = _s3_admin_client(ak, sk, region)
+        try:
+            cli.head_bucket(Bucket=bucket)
+            return None  # already exists and is accessible with these creds
+        except ClientError as e:
+            if not _bucket_missing(e):
+                return str(e)  # 403 / owned by someone else / auth failure
+        kw: dict = {"Bucket": bucket}
+        # us-east-1 (and LocalStack) reject an explicit LocationConstraint.
+        if region and region != "us-east-1" and not os.environ.get("AWS_ENDPOINT_URL"):
+            kw["CreateBucketConfiguration"] = {"LocationConstraint": region}
+        try:
+            cli.create_bucket(**kw)
+        except ClientError as e:
+            code = (getattr(e, "response", {}) or {}).get("Error", {}).get("Code", "")
+            if code != "BucketAlreadyOwnedByYou":
+                return str(e)
+        log.info("connection.bucket_ensured", bucket=bucket, region=region)
     except Exception as e:  # noqa: BLE001
         return str(e)
     return None
@@ -180,9 +236,11 @@ def _validate_or_400(body: ConnectionIn, existing) -> tuple[str, str | None, str
         raise HTTPException(400, f"database test failed: {db_err}")
     if not body.lake_bucket:
         raise HTTPException(400, "lake_bucket is required")
-    aws_err = _test_aws(ak, sk, body.aws_region, body.lake_bucket)
+    # Save provisions the bucket: validate creds AND create the bucket if absent.
+    # If this fails, the connection is NOT saved.
+    aws_err = _ensure_bucket(ak, sk, body.aws_region, body.lake_bucket)
     if aws_err:
-        raise HTTPException(400, f"AWS/bucket test failed: {aws_err}")
+        raise HTTPException(400, f"AWS/bucket setup failed: {aws_err}")
     return dsn, ak, sk
 
 
