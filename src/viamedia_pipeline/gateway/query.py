@@ -5,7 +5,6 @@ result parquet files via signed S3 URLs.
 """
 
 import asyncio
-import io
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -73,15 +72,20 @@ def _run(job: Job) -> None:
             arrow_tbl: pa.Table = result.fetch_arrow_table()
 
         # Write result parquet to a connection's bucket under gateway-results/.
+        # Use pyarrow's native BufferOutputStream + put_object(bytes): the old
+        # path wrote into a Python BytesIO that pyarrow closed on writer.close(),
+        # so the following seek/upload hit "I/O operation on closed file".
         rc = _results_connection()
-        buf = io.BytesIO()
-        pq.write_table(arrow_tbl, buf, compression="zstd")
-        buf.seek(0)
+        sink = pa.BufferOutputStream()
+        pq.write_table(arrow_tbl, sink, compression="zstd")
+        data = sink.getvalue().to_pybytes()
         key = f"{rc.results_prefix}/{job.job_id}.parquet"
-        s3_client(rc).upload_fileobj(buf, rc.lake_bucket, key, ExtraArgs=put_sse_args())
+        s3_client(rc).put_object(
+            Bucket=rc.lake_bucket, Key=key, Body=data, **put_sse_args()
+        )
 
         job.rows = arrow_tbl.num_rows
-        job.bytes_scanned = buf.getbuffer().nbytes
+        job.bytes_scanned = len(data)
         job.result_s3_uri = f"s3://{rc.lake_bucket}/{key}"
         job.status = "SUCCEEDED"
         log.info(
