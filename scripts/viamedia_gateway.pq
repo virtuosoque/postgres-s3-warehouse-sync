@@ -52,7 +52,14 @@ let
                 let
                     resp = Json.Document(Web.Contents(
                         gatewayUrl,
-                        [ RelativePath = "queries/" & jobId, Headers = headers ]
+                        [
+                            RelativePath = "queries/" & jobId,
+                            Headers = headers,
+                            // Changing query param defeats Power Query's response
+                            // cache; without it the loop reuses the first PENDING
+                            // response forever and times out.
+                            Query = [ #"_" = Text.From(n) ]
+                        ]
                     )),
                     status = resp[status]
                 in

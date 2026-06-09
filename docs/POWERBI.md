@@ -95,7 +95,10 @@ let
 
     Poll = (n as number) as record =>
         let
-            R = Json.Document(Web.Contents(Base, [ RelativePath = "queries/" & JobId ]))
+            // Query=[_=n] changes the URL each iteration so Power Query doesn't
+            // serve a cached (PENDING) response and loop until timeout.
+            R = Json.Document(Web.Contents(Base, [
+                    RelativePath = "queries/" & JobId, Query = [ #"_" = Text.From(n) ] ]))
         in
             if R[status] = "SUCCEEDED" or R[status] = "FAILED" or n >= 600
             then R
