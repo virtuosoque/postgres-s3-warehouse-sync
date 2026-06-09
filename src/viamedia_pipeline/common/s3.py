@@ -24,6 +24,10 @@ def s3_client(conn: Connection):
     kwargs = {
         "region_name": conn.aws_region,
         "config": Config(
+            # Force SigV4. The default can emit legacy SigV2 presigned URLs
+            # (AWSAccessKeyId/Signature/Expires) that modern S3 rejects with
+            # "Request has expired" -- which broke the gateway's result downloads.
+            signature_version="s3v4",
             retries={"max_attempts": 10, "mode": "adaptive"},
             max_pool_connections=64,
             s3={"addressing_style": addressing_style},
