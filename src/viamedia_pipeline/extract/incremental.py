@@ -25,6 +25,16 @@ from viamedia_pipeline.state.watermarks import Watermark, get_watermark, set_wat
 log = get_logger(__name__)
 
 
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Normalize a datetime to tz-aware UTC so watermark (always aware UTC) and
+    source row timestamps are comparable. A `timestamp without time zone` column
+    comes back from COPY as naive; we treat such values as UTC (consistent with
+    how `now`/watermarks are produced)."""
+    if dt is None:
+        return None
+    return dt.astimezone(timezone.utc) if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def run_incremental(
     conn_cfg: Connection,
     schema: str,
@@ -72,7 +82,7 @@ def run_incremental(
     )
 
     rows_seen = 0
-    max_ts: datetime = wm.ts
+    max_ts: datetime = _as_utc(wm.ts)  # compare/track in tz-aware UTC
     max_id: int = wm.last_id
 
     import tempfile
@@ -99,8 +109,10 @@ def run_incremental(
                     for row in copy.rows():
                         batch.append(row)
                         rows_seen += 1
-                        # advance running max -- rows already ORDER BY (updated_at, id)
-                        rts = row[ts_idx]
+                        # advance running max -- rows already ORDER BY (updated_at, id).
+                        # Normalize the row ts to UTC so a naive `timestamp` column
+                        # is comparable with the tz-aware watermark.
+                        rts = _as_utc(row[ts_idx])
                         rid = row[id_idx]
                         if rts is not None and (rts, rid) > (max_ts, max_id):
                             max_ts, max_id = rts, rid
