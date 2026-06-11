@@ -5,13 +5,14 @@ result parquet files via signed S3 URLs.
 """
 
 import asyncio
+import os
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Literal
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 from viamedia_pipeline.common.config_store import Connection, list_connections
@@ -63,35 +64,39 @@ def _results_connection() -> Connection:
 def _run(job: Job) -> None:
     job.status = "RUNNING"
     started = time.time()
+    tmp_path: str | None = None
     try:
-        with get_pool().acquire() as conn:
-            # NB: DuckDB has no `statement_timeout`; rely on the SQL guard's
-            # LIMIT cap to bound result size. Add a watchdog if you need a hard
-            # wall-clock limit.
-            result = conn.execute(job.sql)
-            arrow_tbl: pa.Table = result.fetch_arrow_table()
-
-        # Write result parquet to a connection's bucket under gateway-results/.
-        # Use pyarrow's native BufferOutputStream + put_object(bytes): the old
-        # path wrote into a Python BytesIO that pyarrow closed on writer.close(),
-        # so the following seek/upload hit "I/O operation on closed file".
         rc = _results_connection()
-        sink = pa.BufferOutputStream()
-        pq.write_table(arrow_tbl, sink, compression="zstd")
-        data = sink.getvalue().to_pybytes()
+        # Stream the result STRAIGHT to a parquet file via DuckDB COPY, instead of
+        # materializing the whole Arrow table in RAM. DuckDB streams and spills to
+        # disk, so results far larger than memory (hundreds of millions of rows)
+        # succeed -- which is what makes an unlimited (-1) row limit usable.
+        # GATEWAY_RESULT_TMP_DIR can point this at a large/fast volume.
+        tmp_dir = os.environ.get("GATEWAY_RESULT_TMP_DIR") or None
+        fd, tmp_path = tempfile.mkstemp(suffix=".parquet", dir=tmp_dir)
+        os.close(fd)
+        with get_pool().acquire() as conn:
+            # NB: DuckDB has no statement_timeout; the SQL guard governs result
+            # size. job.sql is already guard-validated (single read-only SELECT/
+            # WITH), so wrapping it in COPY (...) is safe.
+            conn.execute(
+                f"COPY ({job.sql}) TO '{tmp_path}' (FORMAT PARQUET, COMPRESSION 'zstd')"
+            )
+
         key = f"{rc.results_prefix}/{job.job_id}.parquet"
-        s3_client(rc).put_object(
-            Bucket=rc.lake_bucket, Key=key, Body=data, **put_sse_args()
+        s3_client(rc).upload_file(
+            tmp_path, rc.lake_bucket, key, ExtraArgs=put_sse_args()
         )
 
-        job.rows = arrow_tbl.num_rows
-        job.bytes_scanned = len(data)
+        job.rows = pq.read_metadata(tmp_path).num_rows
+        job.bytes_scanned = os.path.getsize(tmp_path)
         job.result_s3_uri = f"s3://{rc.lake_bucket}/{key}"
         job.status = "SUCCEEDED"
         log.info(
             "gateway.query.success",
             job_id=job.job_id,
             rows=job.rows,
+            bytes=job.bytes_scanned,
             duration_ms=int((time.time() - started) * 1000),
         )
     except Exception as e:
@@ -100,6 +105,11 @@ def _run(job: Job) -> None:
         log.error("gateway.query.failed", job_id=job.job_id, error=str(e))
     finally:
         job.finished_at = time.time()
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def result_signed_url(job: Job, expires_seconds: int = 3600) -> str | None:

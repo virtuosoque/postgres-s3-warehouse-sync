@@ -290,7 +290,9 @@ const SETTING_HELP={extract_rows_per_chunk:"Rows per parallel extract chunk. LOW
   parquet_compression:"zstd / snappy / gzip",parquet_compression_level:"zstd level 1-22",
   incremental_overlap_seconds:"Seconds of overlap re-scanned each incremental run.",
   incremental_safety_gap_seconds:"Skip rows newer than now-this (avoids in-flight txns).",
-  gateway_query_timeout_seconds:"Query timeout (advisory).",gateway_view_refresh_seconds:"How often query views refresh."};
+  gateway_query_timeout_seconds:"Query timeout (advisory).",gateway_view_refresh_seconds:"How often query views refresh.",
+  gateway_default_row_limit:"LIMIT auto-applied when a query has none. Set -1 for UNLIMITED (returns the whole table — can be huge).",
+  gateway_max_row_limit:"Largest explicit LIMIT allowed. Set -1 to allow any LIMIT (no ceiling)."};
 async function saveSettings(inputs){const body={};Object.entries(inputs).forEach(([k,i])=>body[k]=i.value);$("#smsg").textContent="saving…";
   try{await api("POST","/settings",body);$("#smsg").innerHTML='<span class="ok">saved — applies within ~30s (re-run a sync to use new chunk sizes)</span>';}catch(e){$("#smsg").innerHTML='<span class="bad">'+e+'</span>';}}
 async function renderSettings(){

@@ -39,7 +39,11 @@ def default_config() -> GuardConfig:
         schemas |= {c.iceberg_namespace for c in list_connections(enabled_only=True)}
     except Exception:
         pass
-    return GuardConfig(allowed_schemas=frozenset(schemas))
+    return GuardConfig(
+        allowed_schemas=frozenset(schemas),
+        default_row_limit=s.gateway_default_row_limit,
+        max_row_limit=s.gateway_max_row_limit,
+    )
 
 
 def guard(sql: str, cfg: GuardConfig | None = None) -> str:
@@ -76,12 +80,20 @@ def guard(sql: str, cfg: GuardConfig | None = None) -> str:
                 f"schema '{db.name}' is not allowed (allowed: {sorted(cfg.allowed_schemas)})"
             )
 
-    # Auto-cap LIMIT
+    # Row-limit governance. A negative configured value (e.g. -1) means
+    # UNLIMITED for that knob:
+    #   default_row_limit < 0 -> don't auto-inject a LIMIT when none is given
+    #                            (return the full result -- can be huge).
+    #   max_row_limit     < 0 -> accept any explicit LIMIT, no ceiling.
     if isinstance(stmt, exp.Select):
+        unlimited_default = cfg.default_row_limit is None or cfg.default_row_limit < 0
+        unlimited_max = cfg.max_row_limit is None or cfg.max_row_limit < 0
         limit = stmt.args.get("limit")
         if limit is None:
-            stmt = stmt.limit(cfg.default_row_limit)
-        else:
+            if not unlimited_default:
+                stmt = stmt.limit(cfg.default_row_limit)
+            # else: leave the query unlimited
+        elif not unlimited_max:
             try:
                 n = int(limit.expression.this) if hasattr(limit.expression, "this") else cfg.max_row_limit
                 if n > cfg.max_row_limit:

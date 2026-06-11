@@ -100,7 +100,7 @@ let
             R = Json.Document(Web.Contents(Base, [
                     RelativePath = "queries/" & JobId, Query = [ #"_" = Text.From(n) ] ]))
         in
-            if R[status] = "SUCCEEDED" or R[status] = "FAILED" or n >= 600
+            if R[status] = "SUCCEEDED" or R[status] = "FAILED" or n >= 3600
             then R
             else Function.InvokeAfter(() => @Poll(n + 1), #duration(0, 0, 0, 1)),
 

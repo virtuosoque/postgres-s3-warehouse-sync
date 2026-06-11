@@ -63,7 +63,7 @@ let
                     )),
                     status = resp[status]
                 in
-                    if status = "SUCCEEDED" or status = "FAILED" or n >= 600
+                    if status = "SUCCEEDED" or status = "FAILED" or n >= 3600
                     then resp
                     else Function.InvokeAfter(() => @poll(n + 1), #duration(0, 0, 0, 1)),
 

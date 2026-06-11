@@ -37,6 +37,8 @@ _OVERLAY: dict[str, tuple[str, type]] = {
     "gateway_query_timeout_seconds": ("gateway_query_timeout_seconds", int),
     "gateway_allowed_schemas": ("gateway_allowed_schemas", str),
     "gateway_view_refresh_seconds": ("gateway_view_refresh_seconds", int),
+    "gateway_default_row_limit": ("gateway_default_row_limit", int),
+    "gateway_max_row_limit": ("gateway_max_row_limit", int),
     "log_level": ("log_level", str),
 }
 
@@ -68,6 +70,11 @@ class Settings(BaseSettings):
     gateway_query_timeout_seconds: int = Field(120, alias="GATEWAY_QUERY_TIMEOUT_SECONDS")
     gateway_allowed_schemas: str = Field("viamedia_lake", alias="GATEWAY_ALLOWED_SCHEMAS")
     gateway_view_refresh_seconds: int = Field(60, alias="GATEWAY_VIEW_REFRESH_SECONDS")
+    # Query result-row governance (editable from the UI). -1 = unlimited.
+    #   default_row_limit: LIMIT auto-applied when a query has none.
+    #   max_row_limit:     largest explicit LIMIT allowed.
+    gateway_default_row_limit: int = Field(100_000, alias="GATEWAY_DEFAULT_ROW_LIMIT")
+    gateway_max_row_limit: int = Field(1_000_000, alias="GATEWAY_MAX_ROW_LIMIT")
 
     log_level: str = Field("INFO", alias="LOG_LEVEL")
 
