@@ -128,17 +128,24 @@ def discover(pg_conn: psycopg.Connection, cfg, only_fqns: set[str] | None = None
 
     for schema, name, kind in raw:
         fqn = f"{schema}.{name}"
-        if only_fqns is not None and fqn not in only_fqns:
-            continue
-        if kind not in kinds:
-            skipped_by_kind.append(fqn)
-            continue
-        if include and not _glob_match_any(fqn, include):
-            skipped_by_include.append(fqn)
-            continue
-        if exclude and _glob_match_any(fqn, exclude):
-            skipped_by_exclude.append(fqn)
-            continue
+        if only_fqns is not None:
+            # An explicit UI selection is AUTHORITATIVE: if the user picked this
+            # object, sync it regardless of the connection's object-type toggles
+            # or include/exclude globs (e.g. a selected materialized view whose
+            # kind isn't in sync_object_types). Only the selection membership and
+            # the schema blacklist (applied in the raw query) gate it.
+            if fqn not in only_fqns:
+                continue
+        else:
+            if kind not in kinds:
+                skipped_by_kind.append(fqn)
+                continue
+            if include and not _glob_match_any(fqn, include):
+                skipped_by_include.append(fqn)
+                continue
+            if exclude and _glob_match_any(fqn, exclude):
+                skipped_by_exclude.append(fqn)
+                continue
         cols = introspect_columns(pg_conn, schema, name)
         discovered.append(
             DiscoveredObject(schema=schema, name=name, kind=kind, columns=tuple(cols))

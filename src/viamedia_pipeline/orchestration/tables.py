@@ -137,4 +137,16 @@ def get_table(conn: Connection, fqn: str) -> TableConfig | None:
     for cfg in get_tables(conn, force=True):
         if cfg.fqn == fqn:
             return cfg
+    # Explicitly requested object that isn't in the cached/selected set -- e.g. a
+    # materialized view bootstrapped on demand, or an object not (yet) checked in
+    # the sync selection. Discover JUST this fqn directly; only_fqns is
+    # authoritative, so the connection's object-type/glob filters don't exclude
+    # it. This makes "bootstrap this object" work for any real source object.
+    try:
+        with dedicated_connection(conn) as pg_conn:
+            for o in discover(pg_conn, conn, only_fqns={fqn}):
+                if o.fqn == fqn:
+                    return _config_from_object(o)
+    except Exception as e:  # noqa: BLE001
+        log.warning("get_table.targeted_discovery_failed", connection_id=conn.id, fqn=fqn, error=str(e))
     return None
