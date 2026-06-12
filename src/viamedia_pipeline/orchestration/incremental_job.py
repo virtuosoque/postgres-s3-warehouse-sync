@@ -66,20 +66,30 @@ def incremental_one_table(context: OpExecutionContext) -> dict:
 
     now = datetime.now(timezone.utc)
     s3_prefix = f"incremental/{fqn}"
-    s3_uri, new_wm = run_incremental(
+    s3_uri, new_wm, kind = run_incremental(
         conn, cfg.schema, cfg.table, arrow_schema, s3_prefix, pg_oids=pg_oids, now=now,
+        watermark_column=cfg.watermark_column, pk=cfg.pk,
     )
+    if kind is None:
+        context.log.info(
+            f"incremental.skip conn={connection_id} table={fqn} reason=unsupported_watermark_type"
+        )
+        return {"rows": 0, "skipped": True}
+    from viamedia_pipeline.common import config_store
     if s3_uri is None:
-        advance_watermark_after_merge(conn.id, fqn, new_wm)
+        advance_watermark_after_merge(conn.id, fqn, new_wm, kind)
+        config_store.record_object_sync(conn.id, fqn, "incremental", run_id=context.run_id, rows=0)
         return {"rows": 0}
 
     staged = load_staging_arrow(conn, s3_uri)
     merge_summary = merge_arrow_table(tbl, staged, join_cols=(cfg.pk,))
-    advance_watermark_after_merge(conn.id, fqn, new_wm)
+    advance_watermark_after_merge(conn.id, fqn, new_wm, kind)
+    config_store.record_object_sync(conn.id, fqn, "incremental",
+                                    run_id=context.run_id, rows=staged.num_rows)
 
     context.log.info(
         f"incremental.done conn={connection_id} table={fqn} rows={staged.num_rows} "
-        f"merge={merge_summary} watermark_ts={new_wm.ts.isoformat()} watermark_id={new_wm.last_id}"
+        f"merge={merge_summary} watermark={new_wm.value} watermark_id={new_wm.last_id}"
     )
     return {"rows": staged.num_rows, **merge_summary}
 

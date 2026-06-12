@@ -35,6 +35,8 @@ def reconcile_one_table(context: OpExecutionContext) -> dict:
         context.log.info(f"reconcile.skip conn={connection_id} table={fqn} reason=no_numeric_pk")
         return {"skipped": True}
     summary = reconcile_table(conn, cfg.schema, cfg.table, cfg.iceberg_table_name, pk=cfg.pk)
+    from viamedia_pipeline.common import config_store
+    config_store.record_object_sync(connection_id, fqn, "reconcile", run_id=context.run_id)
     context.log.info(f"reconcile.done conn={connection_id} table={fqn} {summary}")
     return summary
 

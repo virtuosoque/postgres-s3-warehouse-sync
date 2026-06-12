@@ -414,3 +414,157 @@ def set_setting(key: str, value: str | None) -> None:
         conn.commit()
     with _lock:
         _settings_cache = None
+
+
+# --- per-object last-sync status (#8) --------------------------------------
+def record_object_sync(connection_id: int, table_fqn: str, kind: str,
+                       run_id: str | None = None, rows: int | None = None) -> None:
+    """Stamp the last successful sync for an object. Best-effort; never raises
+    into the caller's hot path."""
+    try:
+        with connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pipeline_object_state
+                    (connection_id, table_fqn, last_synced_at, last_kind, last_run_id, last_rows)
+                VALUES (%s, %s, now(), %s, %s, %s)
+                ON CONFLICT (connection_id, table_fqn) DO UPDATE
+                SET last_synced_at = now(), last_kind = EXCLUDED.last_kind,
+                    last_run_id = EXCLUDED.last_run_id, last_rows = EXCLUDED.last_rows
+                """,
+                (connection_id, table_fqn, kind, run_id, rows),
+            )
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        log.warning("object_state.record_failed", connection_id=connection_id,
+                    table=table_fqn, error=str(e))
+
+
+def get_object_state(connection_id: int) -> dict[str, dict]:
+    """{ 'schema.table': {last_synced_at, last_kind, last_rows} } for a connection."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT table_fqn, last_synced_at, last_kind, last_rows "
+            "FROM pipeline_object_state WHERE connection_id = %s",
+            (connection_id,),
+        )
+        rows = cur.fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        ts = r["last_synced_at"]
+        out[r["table_fqn"]] = {
+            "last_synced_at": ts.isoformat() if ts else None,
+            "last_kind": r["last_kind"],
+            "last_rows": r["last_rows"],
+        }
+    return out
+
+
+# --- API tokens (#10) ------------------------------------------------------
+def _hash_token(token: str) -> str:
+    import hashlib
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_api_token(name: str, email: str, connection_id: int, role: str = "viewer") -> dict:
+    """Create a connection-scoped API token. Returns {id, token, ...}; `token`
+    (plaintext) is returned ONCE and never stored — only its SHA-256 hash is."""
+    import secrets
+    role = "admin" if role == "admin" else "viewer"
+    token = "vmt_" + secrets.token_urlsafe(32)
+    prefix = token[:12]
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO pipeline_api_tokens (name, email, connection_id, role, token_hash, token_prefix)
+            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            """,
+            (name, email, connection_id, role, _hash_token(token), prefix),
+        )
+        tid = cur.fetchone()["id"]
+        conn.commit()
+    log.info("token.created", token_id=tid, connection_id=connection_id, role=role, email=email)
+    return {"id": tid, "token": token, "token_prefix": prefix,
+            "name": name, "email": email, "connection_id": connection_id, "role": role}
+
+
+def list_api_tokens() -> list[dict]:
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, name, email, connection_id, role, token_prefix, created_at, "
+            "last_used_at, revoked FROM pipeline_api_tokens ORDER BY created_at DESC"
+        )
+        rows = cur.fetchall()
+    return [
+        {"id": r["id"], "name": r["name"], "email": r["email"],
+         "connection_id": r["connection_id"], "role": r["role"],
+         "token_prefix": r["token_prefix"],
+         "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+         "last_used_at": r["last_used_at"].isoformat() if r["last_used_at"] else None,
+         "revoked": r["revoked"]}
+        for r in rows
+    ]
+
+
+def revoke_api_token(token_id: int) -> None:
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE pipeline_api_tokens SET revoked = true WHERE id = %s", (token_id,))
+        conn.commit()
+
+
+def verify_api_token(token: str) -> dict | None:
+    """Resolve a plaintext token to {id, email, connection_id, role} or None."""
+    if not token:
+        return None
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, email, connection_id, role FROM pipeline_api_tokens "
+            "WHERE token_hash = %s AND revoked = false",
+            (_hash_token(token),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cur.execute("UPDATE pipeline_api_tokens SET last_used_at = now() WHERE id = %s", (row["id"],))
+        conn.commit()
+    return {"id": row["id"], "email": row["email"],
+            "connection_id": row["connection_id"], "role": row["role"]}
+
+
+# --- web-UI users + roles (#7) ---------------------------------------------
+def list_users() -> list[dict]:
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT email, role, enabled, created_at FROM pipeline_users ORDER BY email")
+        rows = cur.fetchall()
+    return [{"email": r["email"], "role": r["role"], "enabled": r["enabled"],
+             "created_at": r["created_at"].isoformat() if r["created_at"] else None}
+            for r in rows]
+
+
+def upsert_user(email: str, role: str = "viewer", enabled: bool = True) -> None:
+    role = "admin" if role == "admin" else "viewer"
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO pipeline_users (email, role, enabled) VALUES (%s, %s, %s)
+            ON CONFLICT (email) DO UPDATE SET role = EXCLUDED.role, enabled = EXCLUDED.enabled
+            """,
+            (email.strip().lower(), role, enabled),
+        )
+        conn.commit()
+
+
+def delete_user(email: str) -> None:
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM pipeline_users WHERE email = %s", (email.strip().lower(),))
+        conn.commit()
+
+
+def get_user(email: str) -> dict | None:
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT email, role, enabled FROM pipeline_users WHERE email = %s",
+                    (email.strip().lower(),))
+        row = cur.fetchone()
+    if not row or not row["enabled"]:
+        return None
+    return {"email": row["email"], "role": row["role"]}

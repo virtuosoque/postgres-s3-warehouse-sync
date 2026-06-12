@@ -75,8 +75,10 @@ UI_HTML = r"""<!doctype html>
     <button data-tab="query">Query</button>
     <button data-tab="runs">Runs</button>
     <button data-tab="settings">Settings</button>
+    <button data-tab="admin">Admin</button>
     <button data-tab="guide">Guide</button>
   </nav>
+  <span id="authbox" class="tokwrap muted"></span>
   <span class="tokwrap"><input id="token" type="password" placeholder="Bearer token (prod)"/></span>
 </header>
 <main>
@@ -85,6 +87,7 @@ UI_HTML = r"""<!doctype html>
   <section id="tab-query" style="display:none"></section>
   <section id="tab-runs" style="display:none"></section>
   <section id="tab-settings" style="display:none"></section>
+  <section id="tab-admin" style="display:none"></section>
   <section id="tab-guide" style="display:none"></section>
 </main>
 <script>
@@ -99,8 +102,8 @@ async function loadConns(){CONNS=(await api("GET","/connections")).connections;r
 
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("active",x===b));
-  ["connections","sync","query","runs","settings","guide"].forEach(t=>$("#tab-"+t).style.display=t===b.dataset.tab?"":"none");
-  ({connections:renderConnections,sync:renderSync,query:renderQuery,runs:renderRuns,settings:renderSettings,guide:renderGuide})[b.dataset.tab]();
+  ["connections","sync","query","runs","settings","admin","guide"].forEach(t=>$("#tab-"+t).style.display=t===b.dataset.tab?"":"none");
+  ({connections:renderConnections,sync:renderSync,query:renderQuery,runs:renderRuns,settings:renderSettings,admin:renderAdmin,guide:renderGuide})[b.dataset.tab]();
 });
 
 /* ---------- Connections ---------- */
@@ -188,20 +191,28 @@ async function renderSync(){
 }
 async function loadObjects(){
   const id=$("#syncConn").value;const box=$("#syncBox");box.innerHTML="";box.append(el("div",{class:"muted"},"discovering objects + loading saved selection…"));
-  try{const [objsR,selR]=await Promise.all([api("GET","/connections/"+id+"/objects"),api("GET","/connections/"+id+"/selection")]);
+  try{const [objsR,selR,statR]=await Promise.all([
+      api("GET","/connections/"+id+"/objects"),
+      api("GET","/connections/"+id+"/selection"),
+      api("GET","/connections/"+id+"/sync-status").catch(()=>({objects:{}}))]);
     box.innerHTML="";box._objs=objsR.objects;
+    const status=statR.objects||{};
+    const lastSynced=(fqn)=>{const st=status[fqn];return (st&&st.last_synced_at)
+      ? (st.last_synced_at.slice(0,16).replace("T"," ")+" UTC · "+(st.last_kind||"")) : "never synced";};
     // saved panel
     const savedWrap=el("div",{class:"saved"});savedWrap.append(el("h3",{style:"margin-top:0"},"Currently saved & syncing"));
     const savedEnabled=selR.selection.filter(s=>s.enabled);
     if(!savedEnabled.length)savedWrap.append(el("span",{class:"muted"},"nothing saved yet — pick objects below and Save selection"));
-    else savedEnabled.forEach(s=>savedWrap.append(el("span",{class:"pill"},s.schema+"."+s.name+" · "+(KIND_LABEL[s.kind]||s.kind))));
+    else savedEnabled.forEach(s=>savedWrap.append(el("span",{class:"pill"},
+      s.schema+"."+s.name+" · "+(KIND_LABEL[s.kind]||s.kind)+" · last synced: "+lastSynced(s.schema+"."+s.name))));
     box.append(savedWrap);
     const savedSet=new Set(savedEnabled.map(s=>s.schema+"."+s.name));
     box.append(el("h3",{},"Available objects (check to include)"));
     const list=el("div",{class:"checklist",id:"objList"});box._list=list;
     objsR.objects.forEach(o=>{const cb=el("input",{type:"checkbox"});cb.checked=savedSet.size?savedSet.has(o.schema+"."+o.name):o.selected;cb._o=o;
       const lab=el("label",{"data-kind":o.kind},cb,el("span",{},o.schema+"."+o.name),el("span",{class:"pill"},KIND_LABEL[o.kind]||o.kind));
-      if(o.incremental)lab.append(el("span",{class:"pill inc"},"incremental"));list.append(lab);});
+      if(o.incremental)lab.append(el("span",{class:"pill inc"},"incremental"));
+      lab.append(el("span",{class:"muted",style:"margin-left:auto;font-size:11px"},lastSynced(o.schema+"."+o.name)));list.append(lab);});
     box.append(list);box.append(el("div",{class:"msg",id:"syncMsg"}));
     box.append(el("div",{class:"topbar"},
       el("button",{class:"btn",onclick:()=>saveSelection(id)},"Save selection"),
@@ -324,7 +335,76 @@ function renderGuide(){
   `}));
 }
 
-renderConnections();
+/* ---------- Admin: users (#7) + API tokens (#10) ---------- */
+async function renderAdmin(){
+  const root=$("#tab-admin");root.innerHTML="";root.append(el("h2",{},"Admin — users & API tokens"));
+  try{await loadConns();}catch(e){}
+  const connName={};CONNS.forEach(c=>connName[c.id]=c.name);
+
+  // --- Microsoft-login users ---
+  const uc=el("div",{class:"card"});root.append(uc);uc.append(el("h3",{style:"margin-top:0"},"Microsoft login — allowed users"));
+  const ut=el("div",{},el("div",{class:"muted"},"loading…"));
+  const ue=el("input",{placeholder:"email@company.com"});
+  const ur=el("select",{},el("option",{value:"viewer"},"viewer (read only)"),el("option",{value:"admin"},"admin (full access)"));
+  uc.append(el("div",{class:"row"},el("div",{},el("label",{},"Email"),ue),el("div",{},el("label",{},"Role"),ur),
+    el("div",{},el("label",{html:"&nbsp;"}),el("button",{class:"btn",onclick:async()=>{if(!ue.value.trim())return;
+      try{await api("POST","/users",{email:ue.value.trim(),role:ur.value,enabled:true});ue.value="";loadUsers();}catch(e){alert(e);}}},"Add / update"))));
+  uc.append(ut);
+  async function loadUsers(){try{const d=await api("GET","/users");const t=el("table");
+    t.append(el("tr",{},...["Email","Role","Enabled",""].map(h=>el("th",{},h))));
+    d.users.forEach(u=>t.append(el("tr",{},el("td",{},u.email),el("td",{},u.role),el("td",{},u.enabled?"yes":"no"),
+      el("td",{class:"act"},el("button",{class:"btn danger",onclick:async()=>{if(!confirm("Remove "+u.email+"?"))return;await api("DELETE","/users/"+encodeURIComponent(u.email));loadUsers();}},"Remove")))));
+    ut.innerHTML="";ut.append(d.users.length?t:el("div",{class:"muted"},"no users yet — add the admin email(s) that can log in"));}
+    catch(e){ut.innerHTML="";ut.append(el("div",{class:"bad"},String(e)));}}
+  loadUsers();
+
+  // --- API tokens (per connection) ---
+  const tc=el("div",{class:"card"});root.append(tc);tc.append(el("h3",{style:"margin-top:0"},"API tokens — scoped to one connection"));
+  const tn=el("input",{placeholder:"token name"});const te=el("input",{placeholder:"associated email"});
+  const tconn=el("select",{});CONNS.forEach(c=>tconn.append(el("option",{value:c.id},c.name)));
+  const trole=el("select",{},el("option",{value:"viewer"},"viewer (read only)"),el("option",{value:"admin"},"admin (full access)"));
+  tc.append(el("div",{class:"row"},el("div",{},el("label",{},"Name"),tn),el("div",{},el("label",{},"Email"),te),
+    el("div",{},el("label",{},"Connection"),tconn),el("div",{},el("label",{},"Role"),trole)));
+  const tmsg=el("div",{class:"msg"});const tt=el("div",{});
+  tc.append(el("div",{class:"topbar"},el("button",{class:"btn",onclick:async()=>{
+    if(!tn.value.trim()||!te.value.trim()){tmsg.textContent="name + email required";return;}
+    try{const r=await api("POST","/tokens",{name:tn.value.trim(),email:te.value.trim(),connection_id:Number(tconn.value),role:trole.value});
+      tmsg.innerHTML="";const box=el("div",{class:"card",style:"word-break:break-all;border-color:var(--yellow)"},
+        el("b",{class:"yell"},"Copy this token now — it is shown only once:"),el("div",{style:"margin-top:6px"},r.token));
+      tc.insertBefore(box,tt);tn.value="";te.value="";loadTokens();}catch(e){tmsg.innerHTML='<span class="bad">'+e+'</span>';}}},"Create token"),tmsg));
+  tc.append(tt);
+  async function loadTokens(){try{const d=await api("GET","/tokens");const t=el("table");
+    t.append(el("tr",{},...["Name","Email","Connection","Role","Prefix","Created","Last used",""].map(h=>el("th",{},h))));
+    d.tokens.forEach(k=>t.append(el("tr",{style:k.revoked?"opacity:.4":""},el("td",{},k.name),el("td",{},k.email),
+      el("td",{},connName[k.connection_id]||k.connection_id),el("td",{},k.role),el("td",{},k.token_prefix+"…"),
+      el("td",{},(k.created_at||"").slice(0,16)),el("td",{},(k.last_used_at||"—").slice(0,16)),
+      el("td",{class:"act"},k.revoked?el("span",{class:"muted"},"revoked"):el("button",{class:"btn danger",onclick:async()=>{await api("DELETE","/tokens/"+k.id);loadTokens();}},"Revoke")))));
+    tt.innerHTML="";tt.append(d.tokens.length?t:el("div",{class:"muted"},"no tokens yet"));}
+    catch(e){tt.innerHTML="";tt.append(el("div",{class:"bad"},String(e)));}}
+  loadTokens();
+}
+
+/* ---------- auth-aware init ---------- */
+let AUTH={enabled:false,authenticated:false,role:"admin"};
+async function init(){
+  try{AUTH=await api("GET","/auth/me");}catch(e){AUTH={enabled:false,authenticated:false,role:"admin"};}
+  if(AUTH.enabled && !AUTH.authenticated){
+    document.querySelector("nav").style.display="none";$("#authbox").innerHTML="";
+    const m=document.querySelector("main");m.innerHTML="";
+    m.append(el("div",{class:"card",style:"max-width:440px;margin:48px auto;text-align:center"},
+      el("h2",{},"Sign in required"),el("p",{class:"muted"},"This data lake requires Microsoft login."),
+      el("a",{href:"/auth/login"},el("button",{class:"btn"},"Sign in with Microsoft"))));
+    return;
+  }
+  const isAdmin=(!AUTH.enabled)||AUTH.role==="admin";window.IS_ADMIN=isAdmin;
+  if(AUTH.enabled){const ab=$("#authbox");ab.innerHTML="";
+    ab.append(el("span",{},(AUTH.email||"")+" · "+(AUTH.role||"")+"  "),el("a",{href:"/auth/logout"},"logout"));}
+  if(!isAdmin){["connections","sync","settings","admin"].forEach(t=>{
+    const b=document.querySelector('nav button[data-tab="'+t+'"]');if(b)b.style.display="none";});}
+  const first=[...document.querySelectorAll("nav button")].find(b=>b.style.display!=="none");
+  if(first)first.click();
+}
+init();
 </script>
 </body>
 </html>

@@ -98,10 +98,52 @@ CREATE TABLE IF NOT EXISTS pipeline_settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Per-object last-sync status (powers the "last synced" display in the UI).
+CREATE TABLE IF NOT EXISTS pipeline_object_state (
+    connection_id  BIGINT NOT NULL,
+    table_fqn      TEXT NOT NULL,
+    last_synced_at TIMESTAMPTZ,
+    last_kind      TEXT,          -- bootstrap | incremental | reconcile
+    last_run_id    TEXT,
+    last_rows      BIGINT,
+    PRIMARY KEY (connection_id, table_fqn)
+);
+
+-- API tokens: scoped to ONE connection, with a role. Only the SHA-256 hash is
+-- stored; the plaintext token is shown once at creation.
+CREATE TABLE IF NOT EXISTS pipeline_api_tokens (
+    id            BIGSERIAL PRIMARY KEY,
+    name          TEXT NOT NULL,
+    email         TEXT NOT NULL,
+    connection_id BIGINT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'viewer',   -- viewer | admin
+    token_hash    TEXT NOT NULL UNIQUE,
+    token_prefix  TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at  TIMESTAMPTZ,
+    revoked       BOOLEAN NOT NULL DEFAULT false
+);
+
+-- Web-UI users + their role, gating Microsoft (Azure AD) login. enabled=false
+-- or absent => not allowed to log in.
+CREATE TABLE IF NOT EXISTS pipeline_users (
+    email      TEXT PRIMARY KEY,
+    role       TEXT NOT NULL DEFAULT 'viewer',       -- viewer | admin
+    enabled    BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Add connection scoping to state tables. connection_id defaults to 1 so any
 -- pre-existing rows map to the first (migrated) connection.
 ALTER TABLE pipeline_watermarks   ADD COLUMN IF NOT EXISTS connection_id BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE pipeline_chunk_state  ADD COLUMN IF NOT EXISTS connection_id BIGINT NOT NULL DEFAULT 1;
+
+-- Generic watermark value: the watermark column may be a timestamp, a date, or
+-- an integer (e.g. an epoch/sequence `updated_at`). last_value stores it as text
+-- (parsed back per the live column type); last_ts becomes nullable since
+-- non-timestamp watermarks don't populate it.
+ALTER TABLE pipeline_watermarks   ADD COLUMN IF NOT EXISTS last_value TEXT;
+ALTER TABLE pipeline_watermarks   ALTER COLUMN last_ts DROP NOT NULL;
 
 -- Make the watermark PK composite (connection_id, table_fqn). Idempotent:
 -- only swaps if the current PK isn't already 2-column.

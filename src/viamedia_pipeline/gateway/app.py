@@ -23,7 +23,12 @@ from viamedia_pipeline.common.settings import EDITABLE_SETTING_KEYS, get_setting
 from viamedia_pipeline.extract.discovery import discover
 from viamedia_pipeline.gateway import dagster_client
 from viamedia_pipeline.gateway import query as q
-from viamedia_pipeline.gateway.auth import Principal, current_principal
+from viamedia_pipeline.gateway.auth import (
+    Principal,
+    current_principal,
+    enforce_connection_scope,
+    require_admin,
+)
 from viamedia_pipeline.gateway.duckdb_pool import get_pool
 from viamedia_pipeline.gateway.sql_guard import SqlGuardError, guard
 from viamedia_pipeline.gateway.view_refresher import ViewRefresher
@@ -56,6 +61,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Viamedia Data Lake", version="0.2.0", lifespan=lifespan)
 app.state.limiter = limiter
+
+# Microsoft (Azure AD) login routes: /auth/login, /auth/callback, /auth/logout,
+# /auth/me. Active only when AZURE_* env is configured (otherwise open mode).
+from viamedia_pipeline.gateway import oauth as _oauth  # noqa: E402
+
+app.include_router(_oauth.router)
 
 
 # --- models ---------------------------------------------------------------
@@ -245,7 +256,7 @@ def _validate_or_400(body: ConnectionIn, existing) -> tuple[str, str | None, str
 
 
 @app.post("/connections")
-def create_connection(body: ConnectionIn, principal: Principal = Depends(current_principal)) -> dict:
+def create_connection(body: ConnectionIn, principal: Principal = Depends(require_admin)) -> dict:
     if not (body.db_host and body.db_name and body.db_user and body.db_password):
         raise HTTPException(400, "db_host, db_name, db_user and db_password are required")
     if not (body.aws_access_key and body.aws_secret_key):
@@ -261,7 +272,8 @@ def create_connection(body: ConnectionIn, principal: Principal = Depends(current
 
 @app.put("/connections/{connection_id}")
 def update_connection(connection_id: int, body: ConnectionIn,
-                      principal: Principal = Depends(current_principal)) -> dict:
+                      principal: Principal = Depends(require_admin)) -> dict:
+    enforce_connection_scope(principal, connection_id)
     existing = config_store.get_connection(connection_id)
     if existing is None:
         raise HTTPException(404, "connection not found")
@@ -275,13 +287,15 @@ def update_connection(connection_id: int, body: ConnectionIn,
 
 
 @app.delete("/connections/{connection_id}")
-def delete_connection(connection_id: int, principal: Principal = Depends(current_principal)) -> dict:
+def delete_connection(connection_id: int, principal: Principal = Depends(require_admin)) -> dict:
+    enforce_connection_scope(principal, connection_id)
     config_store.delete_connection(connection_id)
     return {"deleted": connection_id}
 
 
 @app.post("/connections/{connection_id}/wipe")
-def wipe_connection(connection_id: int, principal: Principal = Depends(current_principal)) -> dict:
+def wipe_connection(connection_id: int, principal: Principal = Depends(require_admin)) -> dict:
+    enforce_connection_scope(principal, connection_id)
     """Delete ALL synced data for a connection but KEEP the connection record
     (and its object selection): drops the Iceberg tables, deletes the S3 lake
     folders, clears watermarks/chunk-state, and deletes the connection's Dagster
@@ -376,7 +390,8 @@ def get_selection(connection_id: int, principal: Principal = Depends(current_pri
 
 @app.post("/connections/{connection_id}/selection")
 def set_selection(connection_id: int, items: list[SelectionItem],
-                  principal: Principal = Depends(current_principal)) -> dict:
+                  principal: Principal = Depends(require_admin)) -> dict:
+    enforce_connection_scope(principal, connection_id)
     payload = [{"schema": it.schema_, "name": it.name, "kind": it.kind,
                 "enabled": it.enabled} for it in items]
     config_store.set_selection(connection_id, payload)
@@ -391,7 +406,7 @@ def read_settings(principal: Principal = Depends(current_principal)) -> dict:
 
 
 @app.post("/settings")
-def write_settings(values: dict[str, str], principal: Principal = Depends(current_principal)) -> dict:
+def write_settings(values: dict[str, str], principal: Principal = Depends(require_admin)) -> dict:
     saved = {}
     for k, v in values.items():
         if k in EDITABLE_SETTING_KEYS:
@@ -400,9 +415,70 @@ def write_settings(values: dict[str, str], principal: Principal = Depends(curren
     return {"saved": saved}
 
 
+# --- API tokens (#10): connection-scoped, name + email, role ----------------
+class TokenIn(BaseModel):
+    name: str = Field(..., min_length=1)
+    email: str = Field(..., min_length=3)
+    connection_id: int
+    role: str = "viewer"
+
+
+@app.get("/tokens")
+def list_tokens(principal: Principal = Depends(require_admin)) -> dict:
+    return {"tokens": config_store.list_api_tokens()}
+
+
+@app.post("/tokens")
+def create_token(body: TokenIn, principal: Principal = Depends(require_admin)) -> dict:
+    if config_store.get_connection(body.connection_id) is None:
+        raise HTTPException(404, "connection not found")
+    # Returns the plaintext token ONCE; only its hash is stored.
+    return config_store.create_api_token(body.name, body.email, body.connection_id, body.role)
+
+
+@app.delete("/tokens/{token_id}")
+def revoke_token(token_id: int, principal: Principal = Depends(require_admin)) -> dict:
+    config_store.revoke_api_token(token_id)
+    return {"revoked": token_id}
+
+
+# --- web-UI users + roles (#7) ---------------------------------------------
+class UserIn(BaseModel):
+    email: str = Field(..., min_length=3)
+    role: str = "viewer"
+    enabled: bool = True
+
+
+@app.get("/users")
+def list_users(principal: Principal = Depends(require_admin)) -> dict:
+    return {"users": config_store.list_users()}
+
+
+@app.post("/users")
+def upsert_user(body: UserIn, principal: Principal = Depends(require_admin)) -> dict:
+    config_store.upsert_user(body.email, body.role, body.enabled)
+    return {"ok": True}
+
+
+@app.delete("/users/{email}")
+def delete_user(email: str, principal: Principal = Depends(require_admin)) -> dict:
+    config_store.delete_user(email)
+    return {"deleted": email}
+
+
+# --- per-object last-sync status (#8) --------------------------------------
+@app.get("/connections/{connection_id}/sync-status")
+def connection_sync_status(connection_id: int,
+                           principal: Principal = Depends(current_principal)) -> dict:
+    enforce_connection_scope(principal, connection_id)
+    return {"objects": config_store.get_object_state(connection_id)}
+
+
 # --- runs (trigger + status via Dagster) ----------------------------------
 @app.post("/runs")
-def launch_run(body: RunLaunch, principal: Principal = Depends(current_principal)) -> dict:
+def launch_run(body: RunLaunch, principal: Principal = Depends(require_admin)) -> dict:
+    # A connection-scoped token may only trigger runs for its own connection.
+    enforce_connection_scope(principal, body.connection_id)
     try:
         if body.mode == "incremental":
             run = dagster_client.launch_incremental(body.connection_id, body.table_fqn)
@@ -455,6 +531,21 @@ def list_tables(principal: Principal = Depends(current_principal)) -> dict:
 
 
 # --- query (sync for UI; async kept for PowerBI) --------------------------
+def _guard_for(principal: Principal):
+    """Guard config for this caller. A connection-scoped API token may only
+    query its own connection's namespace; everyone else gets the default set."""
+    from viamedia_pipeline.gateway.sql_guard import GuardConfig, default_config
+    cfg = default_config()
+    if principal.connection_id is not None:
+        conn = config_store.get_connection(principal.connection_id)
+        ns = conn.iceberg_namespace if conn else None
+        return GuardConfig(
+            allowed_schemas=frozenset({ns} if ns else set()),
+            default_row_limit=cfg.default_row_limit, max_row_limit=cfg.max_row_limit,
+        )
+    return cfg
+
+
 def _json_safe(v):
     if v is None or isinstance(v, (str, int, float, bool)):
         return v
@@ -470,7 +561,7 @@ def _json_safe(v):
 @app.post("/query")
 def run_query_sync(body: RunRequestBody, principal: Principal = Depends(current_principal)) -> dict:
     try:
-        safe_sql = guard(body.sql)
+        safe_sql = guard(body.sql, _guard_for(principal))
     except SqlGuardError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
     try:
@@ -508,13 +599,11 @@ class QueryStatus(BaseModel):
 @app.post("/queries", response_model=QuerySubmitted)
 async def submit_query(body: QueryRequest,
                        principal: Principal = Depends(current_principal)) -> QuerySubmitted:
-    # NOTE: rate limiting was removed here. The installed slowapi calls the
-    # limiter key_func with no args (`lim.key_func()`), which is incompatible with
-    # a key_func that takes the request -> every call 500'd. For a self-hosted,
-    # SQL-guarded gateway, per-endpoint rate limiting isn't essential; if needed,
-    # enforce it at a reverse proxy (nginx/Caddy) or pin a compatible slowapi.
+    # NOTE: rate limiting was removed here (slowapi version incompatibility). For
+    # a self-hosted, SQL-guarded gateway, enforce rate limiting at a reverse proxy
+    # if needed. A connection-scoped token is restricted to its namespace.
     try:
-        safe_sql = guard(body.sql)
+        safe_sql = guard(body.sql, _guard_for(principal))
     except SqlGuardError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
     job = q.submit(safe_sql, principal_sub=principal.sub)

@@ -1,69 +1,110 @@
-"""Postgres-backed (updated_at, id) watermark per table.
+"""Postgres-backed (watermark_value, id) watermark per (connection, table).
 
-Schema (created by viamedia_pipeline.common.migrations):
-    pipeline_watermarks (
-        table_fqn  TEXT PRIMARY KEY,
-        last_ts    TIMESTAMPTZ,
-        last_id    BIGINT,
-        updated_at TIMESTAMPTZ
-    )
+The watermark column can be a timestamp/timestamptz, a date, or an integer
+(e.g. an epoch or sequence `updated_at`). The value is stored as text in
+`last_value` and parsed back according to `kind`. `last_ts` is retained for
+backward compatibility (populated only for timestamp watermarks).
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from typing import Literal
 
 from viamedia_pipeline.common.logging import get_logger
 from viamedia_pipeline.common.metadata_db import connection
 
 log = get_logger(__name__)
 
+WatermarkKind = Literal["timestamp", "date", "integer"]
+
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
 class Watermark:
-    ts: datetime
+    value: object   # datetime (tz-aware) | date | int -- per the column's kind
     last_id: int
 
 
-def get_watermark(connection_id: int, table_fqn: str) -> Watermark:
+def default_value(kind: WatermarkKind):
+    if kind == "integer":
+        return 0
+    if kind == "date":
+        return date(1970, 1, 1)
+    return _EPOCH  # timestamp
+
+
+def _serialize(value: object) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(int(value))  # integer
+
+
+def _parse(text: str | None, kind: WatermarkKind):
+    if text is None:
+        return default_value(kind)
+    if kind == "integer":
+        return int(text)
+    if kind == "date":
+        return date.fromisoformat(text)
+    dt = datetime.fromisoformat(text)  # timestamp
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def get_watermark(connection_id: int, table_fqn: str, kind: WatermarkKind = "timestamp") -> Watermark:
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT last_ts, last_id FROM pipeline_watermarks "
+            "SELECT last_value, last_ts, last_id FROM pipeline_watermarks "
             "WHERE connection_id = %s AND table_fqn = %s",
             (connection_id, table_fqn),
         )
         row = cur.fetchone()
     if not row:
-        return Watermark(ts=_EPOCH, last_id=0)
-    return Watermark(ts=row["last_ts"], last_id=int(row["last_id"]))
+        return Watermark(value=default_value(kind), last_id=0)
+    if row["last_value"] is not None:
+        return Watermark(value=_parse(row["last_value"], kind), last_id=int(row["last_id"]))
+    # Legacy row predating last_value: use last_ts for timestamp watermarks.
+    if kind == "timestamp" and row["last_ts"] is not None:
+        return Watermark(value=row["last_ts"], last_id=int(row["last_id"]))
+    return Watermark(value=default_value(kind), last_id=int(row["last_id"] or 0))
 
 
-def set_watermark(connection_id: int, table_fqn: str, wm: Watermark) -> None:
-    """Upsert with a forward-only condition: only advance if (last_ts, last_id)
-    strictly increases. Prevents out-of-order concurrent runs from rewinding.
-    """
+def set_watermark(connection_id: int, table_fqn: str, wm: Watermark,
+                  kind: WatermarkKind = "timestamp") -> None:
+    """Forward-only upsert: advance only if (value, last_id) strictly increases.
+    Comparison is done in Python under a row lock -- a single text column can't
+    correctly compare timestamps, dates and integers in SQL."""
+    new_text = _serialize(wm.value)
+    last_ts = wm.value if (kind == "timestamp" and isinstance(wm.value, datetime)) else None
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO pipeline_watermarks (connection_id, table_fqn, last_ts, last_id, updated_at)
-            VALUES (%(c)s, %(t)s, %(ts)s, %(id)s, now())
-            ON CONFLICT (connection_id, table_fqn) DO UPDATE
-            SET last_ts    = EXCLUDED.last_ts,
-                last_id    = EXCLUDED.last_id,
-                updated_at = now()
-            WHERE (pipeline_watermarks.last_ts, pipeline_watermarks.last_id)
-                < (EXCLUDED.last_ts, EXCLUDED.last_id)
-            """,
-            {"c": connection_id, "t": table_fqn, "ts": wm.ts, "id": wm.last_id},
+            "SELECT last_value, last_id FROM pipeline_watermarks "
+            "WHERE connection_id = %s AND table_fqn = %s FOR UPDATE",
+            (connection_id, table_fqn),
         )
-        affected = cur.rowcount
+        row = cur.fetchone()
+        if row is not None:
+            cur_val = (_parse(row["last_value"], kind)
+                       if row["last_value"] is not None else default_value(kind))
+            cur_id = int(row["last_id"] or 0)
+            if (wm.value, wm.last_id) <= (cur_val, cur_id):
+                conn.commit()
+                log.warning("watermark.skip.older_than_current", connection_id=connection_id,
+                            table=table_fqn, attempted=new_text, attempted_id=wm.last_id)
+                return
+            cur.execute(
+                "UPDATE pipeline_watermarks "
+                "SET last_value=%s, last_ts=%s, last_id=%s, updated_at=now() "
+                "WHERE connection_id=%s AND table_fqn=%s",
+                (new_text, last_ts, wm.last_id, connection_id, table_fqn),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO pipeline_watermarks "
+                "(connection_id, table_fqn, last_value, last_ts, last_id, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, now())",
+                (connection_id, table_fqn, new_text, last_ts, wm.last_id),
+            )
         conn.commit()
-    if affected == 0:
-        log.warning(
-            "watermark.skip.older_than_current",
-            connection_id=connection_id,
-            table=table_fqn,
-            attempted_ts=wm.ts.isoformat(),
-            attempted_id=wm.last_id,
-        )

@@ -1,8 +1,10 @@
-"""Incremental extract using a (updated_at, id) watermark tuple.
+"""Incremental extract using a (watermark_column, id) watermark tuple.
 
-Window:
-    lo  = last_watermark - overlap_seconds      # catches commit-lag rows
-    hi  = now             - safety_gap_seconds  # avoids in-flight txns
+The watermark column may be a timestamp/timestamptz, a date, or an integer
+(epoch / sequence). The window is built per type:
+
+    timestamp/date : lo = last - overlap, hi = now - safety_gap  (time-bounded)
+    integer        : lo = last, no upper bound (opaque monotonic key)
 
 Re-running the same window is safe -- the downstream MERGE is idempotent.
 """
@@ -20,19 +22,32 @@ from viamedia_pipeline.common.pg import dedicated_connection
 from viamedia_pipeline.common.s3 import put_sse_args, s3_client
 from viamedia_pipeline.common.settings import get_settings
 from viamedia_pipeline.extract.copy_worker import _coerce_for_arrow
-from viamedia_pipeline.state.watermarks import Watermark, get_watermark, set_watermark
+from viamedia_pipeline.state.watermarks import (
+    Watermark,
+    WatermarkKind,
+    get_watermark,
+    set_watermark,
+)
 
 log = get_logger(__name__)
 
 
 def _as_utc(dt: datetime | None) -> datetime | None:
-    """Normalize a datetime to tz-aware UTC so watermark (always aware UTC) and
-    source row timestamps are comparable. A `timestamp without time zone` column
-    comes back from COPY as naive; we treat such values as UTC (consistent with
-    how `now`/watermarks are produced)."""
+    """Normalize a datetime to tz-aware UTC so the watermark (aware UTC) and a
+    naive `timestamp` column's values are comparable (we treat naive as UTC)."""
     if dt is None:
         return None
     return dt.astimezone(timezone.utc) if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _watermark_kind(arrow_type: pa.DataType) -> WatermarkKind | None:
+    if pa.types.is_timestamp(arrow_type):
+        return "timestamp"
+    if pa.types.is_date(arrow_type):
+        return "date"
+    if pa.types.is_integer(arrow_type):
+        return "integer"
+    return None
 
 
 def run_incremental(
@@ -44,57 +59,82 @@ def run_incremental(
     *,
     pg_oids: list[int] | None = None,
     now: datetime | None = None,
-) -> tuple[str | None, Watermark]:
+    watermark_column: str = "updated_at",
+    pk: str = "id",
+) -> tuple[str | None, Watermark | None, WatermarkKind | None]:
     """Pull rows in the watermark window, write one parquet object, return
-    (s3_uri | None, new_watermark). The caller is responsible for MERGE.
-
-    The watermark is NOT advanced here; the orchestrator advances it only
-    after a successful MERGE commit -- this is what makes failures safe.
-    """
+    (s3_uri | None, new_watermark | None, kind | None). The caller MERGEs and
+    advances the watermark only on success. kind is None when the watermark
+    column's type isn't supported for incremental (caller should skip)."""
     s = get_settings()
     fqn = f"{schema}.{table}"
     now = now or datetime.now(timezone.utc)
 
-    wm = get_watermark(conn_cfg.id, fqn)
-    lo_ts = wm.ts - timedelta(seconds=s.incremental_overlap_seconds)
-    hi_ts = now - timedelta(seconds=s.incremental_safety_gap_seconds)
-    if hi_ts <= lo_ts:
-        log.info("incremental.skip.no_window", table=fqn, lo=lo_ts.isoformat(), hi=hi_ts.isoformat())
-        return None, wm
+    field_idx = arrow_schema.get_field_index(watermark_column)
+    if field_idx < 0:
+        log.warning("incremental.no_watermark_column", table=fqn, column=watermark_column)
+        return None, None, None
+    kind = _watermark_kind(arrow_schema.field(field_idx).type)
+    if kind is None:
+        log.warning("incremental.unsupported_watermark_type", table=fqn,
+                    column=watermark_column, arrow_type=str(arrow_schema.field(field_idx).type))
+        return None, None, None
+
+    wm = get_watermark(conn_cfg.id, fqn, kind)
+
+    # Build the window bounds for this kind.
+    hi: object | None = None
+    if kind == "timestamp":
+        lo = wm.value - timedelta(seconds=s.incremental_overlap_seconds)
+        hi = now - timedelta(seconds=s.incremental_safety_gap_seconds)
+        if hi <= lo:
+            log.info("incremental.skip.no_window", table=fqn, lo=str(lo), hi=str(hi))
+            return None, wm, kind
+    elif kind == "date":
+        overlap_days = max(1, (s.incremental_overlap_seconds + 86399) // 86400)
+        lo = wm.value - timedelta(days=overlap_days)
+        hi = (now - timedelta(seconds=s.incremental_safety_gap_seconds)).date()
+        if hi <= lo:
+            log.info("incremental.skip.no_window", table=fqn, lo=str(lo), hi=str(hi))
+            return None, wm, kind
+    else:  # integer: opaque monotonic key, no time-based bounds
+        lo = wm.value
+
+    col = sql.Identifier(watermark_column)
+    pkcol = sql.Identifier(pk)
+    preds = [
+        sql.SQL("({c}, {p}) > ({lo}, {loid})").format(
+            c=col, p=pkcol, lo=sql.Literal(lo), loid=sql.Literal(wm.last_id)
+        )
+    ]
+    if hi is not None:
+        preds.append(sql.SQL("{c} < {hi}").format(c=col, hi=sql.Literal(hi)))
+    copy_stmt = sql.SQL(
+        "COPY (SELECT * FROM {tbl} WHERE {where} ORDER BY {c}, {p}) TO STDOUT (FORMAT BINARY)"
+    ).format(
+        tbl=sql.Identifier(schema, table),
+        where=sql.SQL(" AND ").join(preds),
+        c=col, p=pkcol,
+    )
 
     obj_key = f"{conn_cfg.raw_prefix}/{s3_prefix}/window_{int(now.timestamp())}.parquet"
     s3_uri = f"s3://{conn_cfg.lake_bucket}/{obj_key}"
 
-    copy_stmt = sql.SQL(
-        """
-        COPY (
-            SELECT * FROM {tbl}
-            WHERE (updated_at, id) > ({lo_ts}, {lo_id})
-              AND updated_at < {hi_ts}
-            ORDER BY updated_at, id
-        ) TO STDOUT (FORMAT BINARY)
-        """
-    ).format(
-        tbl=sql.Identifier(schema, table),
-        lo_ts=sql.Literal(wm.ts),
-        lo_id=sql.Literal(wm.last_id),
-        hi_ts=sql.Literal(hi_ts),
-    )
+    def _norm(v):
+        return _as_utc(v) if kind == "timestamp" else v
 
     rows_seen = 0
-    max_ts: datetime = _as_utc(wm.ts)  # compare/track in tz-aware UTC
+    max_val = _norm(wm.value)
     max_id: int = wm.last_id
 
     import tempfile
 
     with tempfile.SpooledTemporaryFile(max_size=64 * 1024**2, mode="w+b") as spool:
         writer = pq.ParquetWriter(
-            spool,
-            arrow_schema,
+            spool, arrow_schema,
             compression=s.parquet_compression,
             compression_level=s.parquet_compression_level,
-            use_dictionary=True,
-            write_statistics=True,
+            use_dictionary=True, write_statistics=True,
         )
         conn = dedicated_connection(conn_cfg)
         try:
@@ -104,18 +144,15 @@ def run_incremental(
                     if pg_oids:
                         copy.set_types(pg_oids)
                     batch: list[tuple] = []
-                    ts_idx = arrow_schema.get_field_index("updated_at")
-                    id_idx = arrow_schema.get_field_index("id")
+                    id_idx = arrow_schema.get_field_index(pk)
                     for row in copy.rows():
                         batch.append(row)
                         rows_seen += 1
-                        # advance running max -- rows already ORDER BY (updated_at, id).
-                        # Normalize the row ts to UTC so a naive `timestamp` column
-                        # is comparable with the tz-aware watermark.
-                        rts = _as_utc(row[ts_idx])
+                        # advance running max (rows already ORDER BY (col, pk)).
+                        rv = _norm(row[field_idx])
                         rid = row[id_idx]
-                        if rts is not None and (rts, rid) > (max_ts, max_id):
-                            max_ts, max_id = rts, rid
+                        if rv is not None and (rv, rid) > (max_val, max_id):
+                            max_val, max_id = rv, rid
                         if len(batch) >= s.extract_row_group_rows:
                             _flush(writer, arrow_schema, batch)
                             batch.clear()
@@ -128,9 +165,11 @@ def run_incremental(
 
         if rows_seen == 0:
             log.info("incremental.empty_window", table=fqn)
-            # Still advance the watermark forward to hi_ts to avoid re-scanning
-            # the same empty window forever. last_id stays the same.
-            return None, Watermark(ts=hi_ts, last_id=wm.last_id)
+            # For a time-bounded window, advance to hi so we don't re-scan the
+            # empty window forever. For an integer key (no hi), leave it.
+            if hi is not None:
+                return None, Watermark(value=hi, last_id=wm.last_id), kind
+            return None, wm, kind
 
         spool.flush()
         spool.seek(0)
@@ -138,15 +177,9 @@ def run_incremental(
             spool, conn_cfg.lake_bucket, obj_key, ExtraArgs=put_sse_args()
         )
 
-    log.info(
-        "incremental.window.done",
-        table=fqn,
-        rows=rows_seen,
-        max_ts=max_ts.isoformat(),
-        max_id=max_id,
-        s3_uri=s3_uri,
-    )
-    return s3_uri, Watermark(ts=max_ts, last_id=max_id)
+    log.info("incremental.window.done", table=fqn, rows=rows_seen,
+             max_value=str(max_val), max_id=max_id, s3_uri=s3_uri)
+    return s3_uri, Watermark(value=max_val, last_id=max_id), kind
 
 
 def _flush(writer: pq.ParquetWriter, schema: pa.Schema, rows: list[tuple]) -> None:
@@ -158,9 +191,10 @@ def _flush(writer: pq.ParquetWriter, schema: pa.Schema, rows: list[tuple]) -> No
     writer.write_table(pa.Table.from_arrays(arrays, schema=schema))
 
 
-def advance_watermark_after_merge(connection_id: int, table_fqn: str, wm: Watermark) -> None:
-    """Call AFTER a successful Iceberg MERGE. Uses a conditional write so
-    concurrent runs can't move the watermark backwards."""
-    set_watermark(connection_id, table_fqn, wm)
+def advance_watermark_after_merge(connection_id: int, table_fqn: str, wm: Watermark,
+                                  kind: WatermarkKind = "timestamp") -> None:
+    """Call AFTER a successful Iceberg MERGE. Forward-only write so concurrent
+    runs can't move the watermark backwards."""
+    set_watermark(connection_id, table_fqn, wm, kind)
     log.info("watermark.advanced", connection_id=connection_id, table=table_fqn,
-             ts=wm.ts.isoformat(), last_id=wm.last_id)
+             value=str(wm.value), last_id=wm.last_id)

@@ -158,7 +158,7 @@ def extract_chunk_op(context: OpExecutionContext, payload: dict) -> dict:
     if key in chunk_state.list_done(run_id):
         context.log.info(f"chunk.skip_already_committed key={key}")
         return {"connection_id": connection_id, "s3_uris": [], "rows": 0,
-                "iceberg_table_name": iceberg_table_name}
+                "iceberg_table_name": iceberg_table_name, "table_fqn": c.fqn}
 
     chunk_state.put(chunk_state.ChunkRecord(
         run_id=run_id, chunk_key=key, connection_id=connection_id, status="RUNNING"))
@@ -183,6 +183,7 @@ def extract_chunk_op(context: OpExecutionContext, payload: dict) -> dict:
             "s3_uris": res.s3_uris,
             "rows": res.rows,
             "iceberg_table_name": iceberg_table_name,
+            "table_fqn": c.fqn,
         }
     except Exception as e:
         chunk_state.put(chunk_state.ChunkRecord(
@@ -203,8 +204,13 @@ def commit_chunks(context: OpExecutionContext, results: list[dict]) -> dict:
 
     connection_id = results[0]["connection_id"]
     iceberg_table_name = results[0]["iceberg_table_name"]
+    table_fqn = results[0].get("table_fqn")
     total_files = sum(len(r.get("s3_uris", [])) for r in results)
     total_rows = sum(r["rows"] for r in results)
+    if table_fqn:
+        from viamedia_pipeline.common import config_store
+        config_store.record_object_sync(connection_id, table_fqn, "bootstrap",
+                                         run_id=context.run_id, rows=total_rows)
     context.log.info(
         f"bootstrap.done conn={connection_id} table={iceberg_table_name} "
         f"files={total_files} rows={total_rows} ts={datetime.now(timezone.utc).isoformat()}"
