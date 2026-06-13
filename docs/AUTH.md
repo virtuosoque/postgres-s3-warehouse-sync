@@ -45,8 +45,12 @@ docker compose -f docker-compose.localaws.yml run --rm migrate
 docker compose -f docker-compose.localaws.yml up -d --force-recreate gateway
 ```
 
-**Bootstrap the first admin** (before login is required, while still open, or via a token):
-`POST /users {"email":"you@org.com","role":"admin"}` — or use the **Admin** tab. Then anyone you add as `viewer`/`admin` can sign in; everyone else is rejected.
+**Bootstrap the first admin** — otherwise you lock yourself out (login is required, but the Admin tab that adds users itself needs an admin). Easiest: set
+```
+AUTH_BOOTSTRAP_ADMINS=you@org.com
+```
+in `.env.localaws` and recreate the gateway. That email is always allowed as admin and is saved into the users table on first sign-in; add everyone else from the **Admin** tab afterward. (Alternatively, insert the first row directly:
+`docker compose ... exec metadata-postgres psql -U pipeline -d pipeline_metadata -c "INSERT INTO pipeline.pipeline_users(email,role,enabled) VALUES('you@org.com','admin',true) ON CONFLICT(email) DO UPDATE SET role='admin',enabled=true;"`)
 
 Notes:
 - The session cookie is `Secure`+`HttpOnly`+`SameSite=Lax`, so the gateway **must be reached over HTTPS** (terminate TLS at your proxy/load balancer in front of `:3000`).

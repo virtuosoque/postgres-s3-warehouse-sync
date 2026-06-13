@@ -112,9 +112,19 @@ def callback(request: Request, code: str | None = None, state: str | None = None
 
     user = config_store.get_user(email)
     if user is None:
-        log.warning("oauth.user_not_allowed", email=email)
-        return JSONResponse(status_code=403, content={
-            "detail": f"{email} is not allowed. Ask an admin to add you under Settings -> Users."})
+        # Bootstrap escape hatch: emails in AUTH_BOOTSTRAP_ADMINS are always
+        # allowed as admin (and persisted on first login), so a fresh deployment
+        # with an empty users table isn't locked out of its own Admin tab.
+        bootstrap = {e.strip().lower() for e in
+                     os.environ.get("AUTH_BOOTSTRAP_ADMINS", "").split(",") if e.strip()}
+        if email in bootstrap:
+            config_store.upsert_user(email, "admin", True)
+            user = {"email": email, "role": "admin"}
+            log.info("oauth.bootstrap_admin", email=email)
+        else:
+            log.warning("oauth.user_not_allowed", email=email)
+            return JSONResponse(status_code=403, content={
+                "detail": f"{email} is not allowed. Ask an admin to add you under the Admin tab."})
 
     session = jwt.encode(
         {"email": email, "role": user["role"], "exp": int(time.time()) + _SESSION_TTL},
