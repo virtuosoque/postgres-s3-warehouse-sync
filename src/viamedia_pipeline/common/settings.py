@@ -20,6 +20,10 @@ import time
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+def _as_bool(v: object) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 # pipeline_settings key -> (Settings attribute, caster)
 _OVERLAY: dict[str, tuple[str, type]] = {
     "extract_rows_per_chunk": ("extract_rows_per_chunk", int),
@@ -39,6 +43,8 @@ _OVERLAY: dict[str, tuple[str, type]] = {
     "gateway_view_refresh_seconds": ("gateway_view_refresh_seconds", int),
     "gateway_default_row_limit": ("gateway_default_row_limit", int),
     "gateway_max_row_limit": ("gateway_max_row_limit", int),
+    "gateway_admin_sql_unrestricted": ("gateway_admin_sql_unrestricted", _as_bool),
+    "sync_drop_removed_columns": ("sync_drop_removed_columns", _as_bool),
     "log_level": ("log_level", str),
 }
 
@@ -75,6 +81,13 @@ class Settings(BaseSettings):
     #   max_row_limit:     largest explicit LIMIT allowed.
     gateway_default_row_limit: int = Field(100_000, alias="GATEWAY_DEFAULT_ROW_LIMIT")
     gateway_max_row_limit: int = Field(1_000_000, alias="GATEWAY_MAX_ROW_LIMIT")
+    # When true, ADMIN login users can run unrestricted SQL in the Query tab
+    # (guard bypassed). Off by default -- even admins stay read-only until enabled.
+    gateway_admin_sql_unrestricted: bool = Field(False, alias="GATEWAY_ADMIN_SQL_UNRESTRICTED")
+    # When true, a column dropped at the source is also DROPPED from the lake
+    # table (destructive). Off by default = removed columns are kept as NULL.
+    # Never drops the pk / watermark / partition columns.
+    sync_drop_removed_columns: bool = Field(False, alias="SYNC_DROP_REMOVED_COLUMNS")
 
     log_level: str = Field("INFO", alias="LOG_LEVEL")
 

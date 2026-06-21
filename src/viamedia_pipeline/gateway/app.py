@@ -546,6 +546,19 @@ def _guard_for(principal: Principal):
     return cfg
 
 
+def _prepare_sql(principal: Principal, sql: str) -> str:
+    """Return the SQL to execute against DuckDB. Interactive ADMIN users (not
+    connection-scoped API tokens) may run ANY statement, including DDL/DML --
+    the guard is bypassed for them. Viewers and connection-scoped tokens stay
+    restricted to guarded, read-only SELECT/WITH within their allowed schemas.
+    The admin bypass is gated by the `gateway_admin_sql_unrestricted` setting
+    (OFF by default -- even admins stay read-only until it is enabled)."""
+    if (principal.is_admin and principal.connection_id is None
+            and get_settings().gateway_admin_sql_unrestricted):
+        return sql
+    return guard(sql, _guard_for(principal))
+
+
 def _json_safe(v):
     if v is None or isinstance(v, (str, int, float, bool)):
         return v
@@ -561,7 +574,7 @@ def _json_safe(v):
 @app.post("/query")
 def run_query_sync(body: RunRequestBody, principal: Principal = Depends(current_principal)) -> dict:
     try:
-        safe_sql = guard(body.sql, _guard_for(principal))
+        safe_sql = _prepare_sql(principal, body.sql)
     except SqlGuardError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
     try:
@@ -570,7 +583,8 @@ def run_query_sync(body: RunRequestBody, principal: Principal = Depends(current_
             desc = cur.description or []
             columns = [d[0] for d in desc]
             column_types = [str(d[1]) for d in desc]  # DuckDB type per column
-            rows = cur.fetchmany(body.limit)
+            # DDL/DML (admin) statements have no result set -> no rows to fetch.
+            rows = cur.fetchmany(body.limit) if desc else []
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status.HTTP_400_BAD_REQUEST, repr(e)[:1000]) from e
     return {
@@ -579,6 +593,7 @@ def run_query_sync(body: RunRequestBody, principal: Principal = Depends(current_
         "rows": [[_json_safe(v) for v in r] for r in rows],
         "row_count": len(rows),
         "truncated": len(rows) >= body.limit,
+        "statement_ok": not desc,  # true for executed DDL/DML with no result set
     }
 
 
@@ -603,7 +618,7 @@ async def submit_query(body: QueryRequest,
     # a self-hosted, SQL-guarded gateway, enforce rate limiting at a reverse proxy
     # if needed. A connection-scoped token is restricted to its namespace.
     try:
-        safe_sql = guard(body.sql, _guard_for(principal))
+        safe_sql = _prepare_sql(principal, body.sql)
     except SqlGuardError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
     job = q.submit(safe_sql, principal_sub=principal.sub)

@@ -303,7 +303,9 @@ const SETTING_HELP={extract_rows_per_chunk:"Rows per parallel extract chunk. LOW
   incremental_safety_gap_seconds:"Skip rows newer than now-this (avoids in-flight txns).",
   gateway_query_timeout_seconds:"Query timeout (advisory).",gateway_view_refresh_seconds:"How often query views refresh.",
   gateway_default_row_limit:"LIMIT auto-applied when a query has none. Set -1 for UNLIMITED (returns the whole table — can be huge).",
-  gateway_max_row_limit:"Largest explicit LIMIT allowed. Set -1 to allow any LIMIT (no ceiling)."};
+  gateway_max_row_limit:"Largest explicit LIMIT allowed. Set -1 to allow any LIMIT (no ceiling).",
+  gateway_admin_sql_unrestricted:"true/false. When true, admin users can run ANY SQL in the Query tab (guard bypassed). Default false = even admins are read-only.",
+  sync_drop_removed_columns:"true/false. When true, a column dropped at the source is also dropped from the lake (destructive — loses that column's history). Default false = kept as NULL. Never drops id / updated_at / created_at."};
 async function saveSettings(inputs){const body={};Object.entries(inputs).forEach(([k,i])=>body[k]=i.value);$("#smsg").textContent="saving…";
   try{await api("POST","/settings",body);$("#smsg").innerHTML='<span class="ok">saved — applies within ~30s (re-run a sync to use new chunk sizes)</span>';}catch(e){$("#smsg").innerHTML='<span class="bad">'+e+'</span>';}}
 async function renderSettings(){
@@ -332,6 +334,36 @@ function renderGuide(){
     <p>Pick a connection to see the status of its sync runs (queued / running / success / failed), including ones you launched from the Sync tab.</p>
     <h3>The engine (localhost:3001)</h3>
     <p>Behind the scenes the actual copy jobs run on <b>Dagster</b>, the scheduling engine, reachable at <code>http://localhost:3001</code>. You normally don't need it — this app triggers and monitors everything for you. Open it only for deep debugging: detailed step logs, run timelines, retries, and the 5-minute incremental schedule. Think of <code>:3000</code> as the dashboard and <code>:3001</code> as the engine room.</p>
+
+    <h3>Data types — how source columns map to the lake</h3>
+    <p>PostgreSQL types are converted to the lake's (Iceberg/Parquet) types automatically. The lake has a smaller, canonical type set, so several Postgres types collapse to one. In the Query tab / PowerBI you'll see the lake type.</p>
+    <table>
+      <tr><th>PostgreSQL type</th><th>Lake type (shown when querying)</th><th>Notes</th></tr>
+      <tr><td>smallint</td><td>int (16-bit)</td><td></td></tr>
+      <tr><td>integer</td><td>int (32-bit)</td><td></td></tr>
+      <tr><td>bigint</td><td>long (64-bit)</td><td></td></tr>
+      <tr><td>real</td><td>float</td><td></td></tr>
+      <tr><td>double precision</td><td>double</td><td></td></tr>
+      <tr><td>numeric / decimal(p,s)</td><td>decimal(p,s)</td><td>unconstrained numeric → decimal(38,9)</td></tr>
+      <tr><td>boolean</td><td>boolean</td><td></td></tr>
+      <tr><td>text, varchar, varchar(n), char(n)</td><td>string (VARCHAR)</td><td>all collapse to one string type — no length / char-vs-varchar in the lake</td></tr>
+      <tr><td>uuid</td><td>string (UUID)</td><td></td></tr>
+      <tr><td>json, jsonb</td><td>string</td><td>stored as text</td></tr>
+      <tr><td>date</td><td>date</td><td></td></tr>
+      <tr><td>timestamp without time zone</td><td>timestamp (no zone)</td><td>stored as-is (naive)</td></tr>
+      <tr><td>timestamp with time zone</td><td>timestamp (UTC)</td><td>stored as the UTC instant; same moment, shown in UTC</td></tr>
+      <tr><td>bytea</td><td>binary</td><td></td></tr>
+      <tr><td>arrays (e.g. int[])</td><td>list</td><td></td></tr>
+      <tr><td>anything else</td><td>string</td><td>safe fallback</td></tr>
+    </table>
+    <h3>Schema changes — what's handled automatically</h3>
+    <ul>
+      <li><b>Add a column</b> → added to the lake (existing rows read NULL). ✓</li>
+      <li><b>Drop a column</b> → kept in the lake as NULL by default. Turn on <code>sync_drop_removed_columns</code> in Settings to actually drop it (destructive; never drops id / updated_at / created_at). </li>
+      <li><b>Widen a type</b> (int→bigint, float→double, more decimal precision) → applied automatically. ✓</li>
+      <li><b>Incompatible type change</b> (e.g. text↔number, decimal scale change) → not auto-migrated; that table needs <b>Wipe → Bootstrap</b>.</li>
+      <li><b>text ↔ varchar ↔ char</b> → no change (all the same lake type).</li>
+    </ul>
   `}));
 }
 

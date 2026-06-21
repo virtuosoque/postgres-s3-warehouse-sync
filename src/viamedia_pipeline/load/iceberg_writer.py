@@ -322,7 +322,8 @@ def commit_files_with_retry(
     ) from last_err
 
 
-def evolve_table_schema(conn: Connection, table: str, source_schema: IcebergSchema) -> Table:
+def evolve_table_schema(conn: Connection, table: str, source_schema: IcebergSchema,
+                        *, protected_columns: set[str] | None = None) -> Table:
     """Reconcile the Iceberg table's schema with the current source schema, then
     return the reloaded table.
 
@@ -330,12 +331,16 @@ def evolve_table_schema(conn: Connection, table: str, source_schema: IcebergSche
       - ADDS columns present in the source but not the table (old rows read NULL),
       - applies SAFE type promotions (int->long, float->double, decimal precision
         increase),
-      - never drops columns (a column removed at the source stays in the lake and
-        is simply NULL for new rows -- standard lakehouse behavior).
+      - never drops columns.
+
+    If the `sync_drop_removed_columns` setting is ON, columns present in the lake
+    but NOT in the source are then DROPPED (destructive) -- EXCEPT the pk /
+    watermark / partition columns (and any partition-source column, which Iceberg
+    refuses to drop). Off by default: removed columns are kept as NULL (the safe,
+    non-destructive lakehouse default).
 
     Incompatible changes (e.g. string<->int, decimal SCALE changes) are not valid
-    Iceberg promotions; we log and skip them rather than fail the sync (such a
-    column would need a manual re-bootstrap).
+    Iceberg promotions; we log and skip them rather than fail the sync.
     """
     cat = catalog(conn)
     ident = (conn.iceberg_namespace, table)
@@ -347,4 +352,44 @@ def evolve_table_schema(conn: Connection, table: str, source_schema: IcebergSche
     except Exception as e:  # noqa: BLE001
         log.warning("iceberg.schema.evolve_skipped",
                     table=f"{conn.iceberg_namespace}.{table}", error=str(e))
-    return cat.load_table(ident)
+    tbl = cat.load_table(ident)
+
+    if get_settings().sync_drop_removed_columns:
+        tbl = _drop_removed_columns(conn, tbl, ident, source_schema, protected_columns or set())
+    return tbl
+
+
+def _drop_removed_columns(conn: Connection, tbl: Table, ident, source_schema: IcebergSchema,
+                          protected: set[str]) -> Table:
+    """Drop lake columns absent from the source, never touching protected or
+    partition-source columns. Best-effort: logs + skips on any error."""
+    source_names = {f.name for f in source_schema.fields}
+    schema = tbl.schema()
+    # Partition-source columns can't be dropped by Iceberg -> always protect them.
+    part_sources: set[str] = set()
+    try:
+        for pf in tbl.spec().fields:
+            name = schema.find_column_name(pf.source_id)
+            if name:
+                part_sources.add(name)
+    except Exception:  # noqa: BLE001
+        pass
+    keep = {n for n in protected if n} | part_sources
+
+    to_drop = [f.name for f in schema.fields if f.name not in source_names and f.name not in keep]
+    if not to_drop:
+        return tbl
+    try:
+        with tbl.update_schema() as upd:
+            for name in to_drop:
+                upd.delete_column(name)
+        log.warning("iceberg.schema.columns_dropped",
+                    table=f"{conn.iceberg_namespace}.{ident[1]}", dropped=to_drop)
+    except Exception as e:  # noqa: BLE001
+        log.warning("iceberg.schema.drop_skipped",
+                    table=f"{conn.iceberg_namespace}.{ident[1]}", columns=to_drop, error=str(e))
+    return cat_load(conn, ident)
+
+
+def cat_load(conn: Connection, ident) -> Table:
+    return catalog(conn).load_table(ident)

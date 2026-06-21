@@ -61,19 +61,23 @@ def merge_arrow_table(
     if "updated_at" in staged.schema.names and "id" in staged.schema.names:
         staged = _dedupe_latest(staged, key="id", ts="updated_at")
 
-    # Align to the table's (possibly just-evolved) schema before upserting.
+    # Align to the table's (possibly just-evolved) schema before writing.
     staged = align_to_table(staged, iceberg_table)
 
-    result = iceberg_table.upsert(
-        df=staged,
-        join_cols=list(join_cols),
-        when_matched_update_all=when_matched_update_all,
-        when_not_matched_insert_all=when_not_matched_insert_all,
-    )
-    summary = {
-        "rows_updated": getattr(result, "rows_updated", None),
-        "rows_inserted": getattr(result, "rows_inserted", None),
-    }
+    # Upsert via overwrite(filter=In(pk, keys)): atomically delete the rows we're
+    # replacing, then append the new versions. Unlike pyiceberg `upsert`, this
+    # does NOT reconcile existing-vs-incoming schemas internally, so it survives
+    # a column ADDED after the existing data files were written (schema
+    # evolution) -- which is exactly what breaks `upsert.get_rows_to_update`.
+    from pyiceberg.expressions import In
+
+    pk = join_cols[0]
+    keys = [k for k in staged.column(pk).to_pylist() if k is not None]
+    if keys:
+        iceberg_table.overwrite(df=staged, overwrite_filter=In(pk, keys))
+    elif staged.num_rows:
+        iceberg_table.append(staged)
+    summary = {"rows_written": staged.num_rows, "keys": len(keys)}
     log.info("iceberg.upsert.done", table=iceberg_table.name(), **summary)
     return summary
 

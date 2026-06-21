@@ -85,7 +85,10 @@ def plan_bootstrap(context: OpExecutionContext):
                             partition_by=list(cfg.partition_by))
         # If re-bootstrapping after a source DDL change, evolve the existing
         # table so it's a superset of the current source columns before add_files.
-        evolve_table_schema(conn, cfg.iceberg_table_name, iceberg_schema)
+        _protected = {cfg.pk, *([cfg.watermark_column] if cfg.watermark_column else []),
+                      *(p[0] for p in cfg.partition_by)}
+        evolve_table_schema(conn, cfg.iceberg_table_name, iceberg_schema,
+                            protected_columns=_protected)
         # Parallel id-range chunking only pays off when the key is indexed;
         # otherwise each chunk would full-scan the table, so stream one COPY.
         numeric_id = cfg.supports_parallel_chunking and has_leading_index(

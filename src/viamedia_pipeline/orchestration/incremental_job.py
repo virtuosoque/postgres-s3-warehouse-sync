@@ -60,9 +60,12 @@ def incremental_one_table(context: OpExecutionContext) -> dict:
     iceberg_schema = iceberg_schema_for(cols)
     tbl = create_or_get_table(conn, cfg.iceberg_table_name, iceberg_schema,
                               partition_by=list(cfg.partition_by))
-    # Reconcile the table schema with the current source (add new columns, keep
-    # dropped ones as NULL, apply safe type promotions) before merging.
-    tbl = evolve_table_schema(conn, cfg.iceberg_table_name, iceberg_schema)
+    # Reconcile the table schema with the current source (add new columns, apply
+    # safe type promotions; optionally drop removed columns) before merging.
+    protected_cols = {cfg.pk, *( [cfg.watermark_column] if cfg.watermark_column else [] ),
+                      *(p[0] for p in cfg.partition_by)}
+    tbl = evolve_table_schema(conn, cfg.iceberg_table_name, iceberg_schema,
+                              protected_columns=protected_cols)
 
     now = datetime.now(timezone.utc)
     s3_prefix = f"incremental/{fqn}"
