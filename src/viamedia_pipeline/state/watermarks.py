@@ -15,14 +15,19 @@ from viamedia_pipeline.common.metadata_db import connection
 
 log = get_logger(__name__)
 
-WatermarkKind = Literal["timestamp", "date", "integer"]
+# timestamp_tz   = `timestamp with time zone`    -> tz-aware UTC instants
+# timestamp_naive = `timestamp without time zone` -> naive wall-clock, compared
+#                   in its own frame (NEVER coerced to UTC, or the window breaks
+#                   when the DB's zone isn't UTC).
+WatermarkKind = Literal["timestamp_tz", "timestamp_naive", "date", "integer"]
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_EPOCH_NAIVE = datetime(1970, 1, 1)
 
 
 @dataclass(frozen=True)
 class Watermark:
-    value: object   # datetime (tz-aware) | date | int -- per the column's kind
+    value: object   # datetime (tz-aware or naive) | date | int -- per the column's kind
     last_id: int
 
 
@@ -31,7 +36,9 @@ def default_value(kind: WatermarkKind):
         return 0
     if kind == "date":
         return date(1970, 1, 1)
-    return _EPOCH  # timestamp
+    if kind == "timestamp_naive":
+        return _EPOCH_NAIVE
+    return _EPOCH  # timestamp_tz
 
 
 def _serialize(value: object) -> str:
@@ -49,11 +56,13 @@ def _parse(text: str | None, kind: WatermarkKind):
         return int(text)
     if kind == "date":
         return date.fromisoformat(text)
-    dt = datetime.fromisoformat(text)  # timestamp
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    dt = datetime.fromisoformat(text)
+    if kind == "timestamp_naive":
+        return dt.replace(tzinfo=None)  # always naive, even if an offset was stored
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)  # timestamp_tz
 
 
-def get_watermark(connection_id: int, table_fqn: str, kind: WatermarkKind = "timestamp") -> Watermark:
+def get_watermark(connection_id: int, table_fqn: str, kind: WatermarkKind = "timestamp_tz") -> Watermark:
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT last_value, last_ts, last_id FROM pipeline_watermarks "
@@ -65,19 +74,24 @@ def get_watermark(connection_id: int, table_fqn: str, kind: WatermarkKind = "tim
         return Watermark(value=default_value(kind), last_id=0)
     if row["last_value"] is not None:
         return Watermark(value=_parse(row["last_value"], kind), last_id=int(row["last_id"]))
-    # Legacy row predating last_value: use last_ts for timestamp watermarks.
-    if kind == "timestamp" and row["last_ts"] is not None:
-        return Watermark(value=row["last_ts"], last_id=int(row["last_id"]))
+    # Legacy row predating last_value: fall back to last_ts for timestamp kinds.
+    if kind in ("timestamp_tz", "timestamp_naive") and row["last_ts"] is not None:
+        val = row["last_ts"]
+        if kind == "timestamp_naive" and val.tzinfo is not None:
+            val = val.replace(tzinfo=None)
+        return Watermark(value=val, last_id=int(row["last_id"]))
     return Watermark(value=default_value(kind), last_id=int(row["last_id"] or 0))
 
 
 def set_watermark(connection_id: int, table_fqn: str, wm: Watermark,
-                  kind: WatermarkKind = "timestamp") -> None:
+                  kind: WatermarkKind = "timestamp_tz") -> None:
     """Forward-only upsert: advance only if (value, last_id) strictly increases.
     Comparison is done in Python under a row lock -- a single text column can't
     correctly compare timestamps, dates and integers in SQL."""
     new_text = _serialize(wm.value)
-    last_ts = wm.value if (kind == "timestamp" and isinstance(wm.value, datetime)) else None
+    # last_ts is legacy/secondary (TIMESTAMPTZ); only populate it for tz-aware
+    # timestamps -- a naive value there would be reinterpreted in the DB's zone.
+    last_ts = wm.value if (kind == "timestamp_tz" and isinstance(wm.value, datetime)) else None
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT last_value, last_id FROM pipeline_watermarks "

@@ -42,7 +42,9 @@ def _as_utc(dt: datetime | None) -> datetime | None:
 
 def _watermark_kind(arrow_type: pa.DataType) -> WatermarkKind | None:
     if pa.types.is_timestamp(arrow_type):
-        return "timestamp"
+        # tz-aware (timestamptz) -> UTC instants; tz-naive -> wall-clock handled
+        # in its own frame (no UTC coercion).
+        return "timestamp_tz" if arrow_type.tz is not None else "timestamp_naive"
     if pa.types.is_date(arrow_type):
         return "date"
     if pa.types.is_integer(arrow_type):
@@ -84,12 +86,19 @@ def run_incremental(
 
     # Build the window bounds for this kind.
     hi: object | None = None
-    if kind == "timestamp":
+    if kind == "timestamp_tz":
         lo = wm.value - timedelta(seconds=s.incremental_overlap_seconds)
         hi = now - timedelta(seconds=s.incremental_safety_gap_seconds)
         if hi <= lo:
             log.info("incremental.skip.no_window", table=fqn, lo=str(lo), hi=str(hi))
             return None, wm, kind
+    elif kind == "timestamp_naive":
+        # Naive wall-clock in an unknown zone: stay entirely in the column's own
+        # frame. No UTC `now` upper bound (that's what broke the window when the
+        # DB zone wasn't UTC); rely on the overlap re-scan + idempotent MERGE,
+        # like the integer key. `lo` is a NAIVE datetime, so psycopg sends it as
+        # `timestamp` (no tz cast against the column).
+        lo = wm.value - timedelta(seconds=s.incremental_overlap_seconds)
     elif kind == "date":
         overlap_days = max(1, (s.incremental_overlap_seconds + 86399) // 86400)
         lo = wm.value - timedelta(days=overlap_days)
@@ -121,7 +130,7 @@ def run_incremental(
     s3_uri = f"s3://{conn_cfg.lake_bucket}/{obj_key}"
 
     def _norm(v):
-        return _as_utc(v) if kind == "timestamp" else v
+        return _as_utc(v) if kind == "timestamp_tz" else v
 
     rows_seen = 0
     max_val = _norm(wm.value)
@@ -192,7 +201,7 @@ def _flush(writer: pq.ParquetWriter, schema: pa.Schema, rows: list[tuple]) -> No
 
 
 def advance_watermark_after_merge(connection_id: int, table_fqn: str, wm: Watermark,
-                                  kind: WatermarkKind = "timestamp") -> None:
+                                  kind: WatermarkKind = "timestamp_tz") -> None:
     """Call AFTER a successful Iceberg MERGE. Forward-only write so concurrent
     runs can't move the watermark backwards."""
     set_watermark(connection_id, table_fqn, wm, kind)

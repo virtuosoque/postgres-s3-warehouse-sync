@@ -12,8 +12,10 @@ dependencies = [
     # Arrow / parquet
     "pyarrow>=18.0.0",
     "polars>=1.12.0",
-    # Iceberg (SqlCatalog backed by Postgres; S3 via s3fs)
-    "pyiceberg[s3fs,sql-postgres]>=0.8.1",
+    # Iceberg (SqlCatalog backed by Postgres; S3 via s3fs). pyiceberg-core (Rust)
+    # is required to compute partition transforms when upsert/append rewrites
+    # data into a PARTITIONED table (incremental MERGE on day(created_at) tables).
+    "pyiceberg[s3fs,sql-postgres,pyiceberg-core]>=0.8.1",
     "boto3>=1.35.0",
     "botocore>=1.35.0",
     # Orchestration
