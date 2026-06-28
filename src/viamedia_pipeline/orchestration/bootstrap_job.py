@@ -214,6 +214,18 @@ def commit_chunks(context: OpExecutionContext, results: list[dict]) -> dict:
         from viamedia_pipeline.common import config_store
         config_store.record_object_sync(connection_id, table_fqn, "bootstrap",
                                          run_id=context.run_id, rows=total_rows)
+        # Seed the incremental watermark to the current source max so the FIRST
+        # incremental only pulls new rows -- otherwise it re-scans the whole table
+        # into memory and OOMs. Best-effort; never fails the bootstrap.
+        try:
+            conn = _require_connection(connection_id)
+            cfg = get_table(conn, table_fqn)
+            if cfg and cfg.supports_incremental:
+                from viamedia_pipeline.extract.incremental import seed_watermark
+                seed_watermark(conn, cfg.schema, cfg.table, table_fqn,
+                               cfg.watermark_column, cfg.pk)
+        except Exception as e:  # noqa: BLE001
+            context.log.warning(f"bootstrap.watermark_seed_failed table={table_fqn} error={e}")
     context.log.info(
         f"bootstrap.done conn={connection_id} table={iceberg_table_name} "
         f"files={total_files} rows={total_rows} ts={datetime.now(timezone.utc).isoformat()}"

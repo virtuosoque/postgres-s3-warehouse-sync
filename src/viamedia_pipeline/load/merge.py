@@ -105,11 +105,8 @@ def _dedupe_latest(tbl: pa.Table, *, key: str, ts: str) -> pa.Table:
     return tbl_sorted.filter(pa.array(keep))
 
 
-def load_staging_arrow(conn: Connection, s3_uri: str) -> pa.Table:
-    """Read a single staging parquet object into Arrow using the connection's
-    AWS credentials (and the LocalStack endpoint when set)."""
+def _staging_fs(conn: Connection):
     import pyarrow.fs as pafs
-    import pyarrow.parquet as pq
 
     fs_kwargs: dict = {"region": conn.aws_region}
     if conn.aws_access_key and conn.aws_secret_key:
@@ -119,5 +116,46 @@ def load_staging_arrow(conn: Connection, s3_uri: str) -> pa.Table:
     if endpoint:
         fs_kwargs["endpoint_override"] = endpoint
         fs_kwargs["scheme"] = "https" if endpoint.startswith("https") else "http"
-    fs = pafs.S3FileSystem(**fs_kwargs)
-    return pq.read_table(s3_uri.removeprefix("s3://"), filesystem=fs)
+    return pafs.S3FileSystem(**fs_kwargs)
+
+
+def load_staging_arrow(conn: Connection, s3_uri: str) -> pa.Table:
+    """Read a single staging parquet object fully into Arrow (small results)."""
+    import pyarrow.parquet as pq
+    return pq.read_table(s3_uri.removeprefix("s3://"), filesystem=_staging_fs(conn))
+
+
+def merge_parquet_batched(iceberg_table: Table, conn: Connection, s3_uri: str, *,
+                          join_cols: tuple[str, ...] = ("id",),
+                          batch_rows: int = 200_000) -> dict:
+    """Stream the staging parquet in row-batches and upsert each batch, so a
+    large incremental window never materializes the whole result in memory.
+
+    The extract writes rows ordered by (updated_at, id), so a later batch that
+    repeats a key overwrites the earlier one -> newest wins. Each batch is its
+    own atomic overwrite(filter=In(pk, batch_keys)); per-batch dedupe guards
+    against the same id appearing twice within one batch.
+    """
+    import pyarrow.parquet as pq
+    from pyiceberg.expressions import In
+
+    pk = join_cols[0]
+    pf = pq.ParquetFile(s3_uri.removeprefix("s3://"), filesystem=_staging_fs(conn))
+    total = 0
+    batches = 0
+    for rb in pf.iter_batches(batch_size=batch_rows):
+        staged = pa.Table.from_batches([rb])
+        if staged.num_rows == 0:
+            continue
+        if "updated_at" in staged.schema.names and "id" in staged.schema.names:
+            staged = _dedupe_latest(staged, key="id", ts="updated_at")
+        staged = align_to_table(staged, iceberg_table)
+        keys = [k for k in staged.column(pk).to_pylist() if k is not None]
+        if keys:
+            iceberg_table.overwrite(df=staged, overwrite_filter=In(pk, keys))
+        elif staged.num_rows:
+            iceberg_table.append(staged)
+        total += staged.num_rows
+        batches += 1
+    log.info("iceberg.upsert.batched", table=iceberg_table.name(), rows=total, batches=batches)
+    return {"rows_written": total, "batches": batches}

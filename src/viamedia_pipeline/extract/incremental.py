@@ -52,6 +52,46 @@ def _watermark_kind(arrow_type: pa.DataType) -> WatermarkKind | None:
     return None
 
 
+def seed_watermark(conn_cfg: Connection, schema: str, table: str, table_fqn: str,
+                   watermark_column: str = "updated_at", pk: str = "id") -> bool:
+    """Set the incremental watermark to the CURRENT source maximum, so the first
+    incremental after a bootstrap pulls only genuinely new rows instead of
+    re-scanning the whole table (which materializes everything in memory -> OOM).
+
+    Called at the end of bootstrap; also safe to run once on already-bootstrapped
+    tables. Returns False if the table isn't incremental-eligible / max is NULL.
+    """
+    from viamedia_pipeline.extract.schema import arrow_schema_for, introspect_columns
+
+    with dedicated_connection(conn_cfg) as pg_conn:
+        cols = introspect_columns(pg_conn, schema, table)
+        arrow_schema = arrow_schema_for(cols)
+        idx = arrow_schema.get_field_index(watermark_column)
+        if idx < 0:
+            return False
+        kind = _watermark_kind(arrow_schema.field(idx).type)
+        if kind is None:
+            return False
+        with pg_conn.cursor() as cur:
+            cur.execute(f'SELECT max("{watermark_column}") AS m FROM "{schema}"."{table}"')  # noqa: S608
+            row = cur.fetchone()
+            max_w = row["m"] if isinstance(row, dict) else row[0]
+            if max_w is None:
+                return False
+            cur.execute(  # noqa: S608 - identifiers quoted
+                f'SELECT max("{pk}") AS m FROM "{schema}"."{table}" WHERE "{watermark_column}" = %s',
+                (max_w,),
+            )
+            row2 = cur.fetchone()
+            max_id = (row2["m"] if isinstance(row2, dict) else row2[0]) or 0
+        pg_conn.rollback()
+
+    set_watermark(conn_cfg.id, table_fqn, Watermark(value=max_w, last_id=int(max_id)), kind)
+    log.info("watermark.seeded", connection_id=conn_cfg.id, table=table_fqn,
+             value=str(max_w), last_id=int(max_id), kind=kind)
+    return True
+
+
 def run_incremental(
     conn_cfg: Connection,
     schema: str,

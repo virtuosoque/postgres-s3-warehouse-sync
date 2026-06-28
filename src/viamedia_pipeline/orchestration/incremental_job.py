@@ -35,7 +35,7 @@ from viamedia_pipeline.load.iceberg_writer import (
     ensure_namespace,
     evolve_table_schema,
 )
-from viamedia_pipeline.load.merge import load_staging_arrow, merge_arrow_table
+from viamedia_pipeline.load.merge import merge_parquet_batched
 from viamedia_pipeline.orchestration.tables import get_table, get_tables
 
 
@@ -84,17 +84,17 @@ def incremental_one_table(context: OpExecutionContext) -> dict:
         config_store.record_object_sync(conn.id, fqn, "incremental", run_id=context.run_id, rows=0)
         return {"rows": 0}
 
-    staged = load_staging_arrow(conn, s3_uri)
-    merge_summary = merge_arrow_table(tbl, staged, join_cols=(cfg.pk,))
+    merge_summary = merge_parquet_batched(tbl, conn, s3_uri, join_cols=(cfg.pk,))
     advance_watermark_after_merge(conn.id, fqn, new_wm, kind)
     config_store.record_object_sync(conn.id, fqn, "incremental",
-                                    run_id=context.run_id, rows=staged.num_rows)
+                                    run_id=context.run_id, rows=merge_summary.get("rows_written", 0))
 
+    rows = merge_summary.get("rows_written", 0)
     context.log.info(
-        f"incremental.done conn={connection_id} table={fqn} rows={staged.num_rows} "
+        f"incremental.done conn={connection_id} table={fqn} rows={rows} "
         f"merge={merge_summary} watermark={new_wm.value} watermark_id={new_wm.last_id}"
     )
-    return {"rows": staged.num_rows, **merge_summary}
+    return {"rows": rows, **merge_summary}
 
 
 @job(config={"ops": {"incremental_one_table": {"config": {"connection_id": 1, "table_fqn": "public.events"}}}})

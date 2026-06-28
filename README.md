@@ -270,3 +270,10 @@ signed S3 URL. Paste an OIDC access token at the credential prompt.
 - [ ] Logical replication CDC consumer for hard deletes
 - [ ] Multi-host gateway (NLB in front of N gateways; metadata-postgres on RDS)
 - [ ] DuckDB Postgres-wire-protocol shim → native PowerBI ODBC
+
+
+docker exec postgres-s3-warehouse-sync-metadata-postgres-1 \
+  psql -U pipeline -d pipeline_metadata -c \
+  "INSERT INTO pipeline.pipeline_users (email, role, enabled) VALUES ('prashant.viamedia@gmail.com','admin',true) ON CONFLICT (email) DO UPDATE SET role='admin', enabled=true;" \
+  && echo "--- verify ---" \
+  && docker exec postgres-s3-warehouse-sync-metadata-postgres-1 psql -U pipeline -d pipeline_metadata -c "SELECT email, role, enabled FROM pipeline.pipeline_users;"
